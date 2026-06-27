@@ -10,24 +10,24 @@ button.addEventListener("click", async () => {
             currentWindow: true
         });
 
+        const url = tab && tab.url ? tab.url : "";
+
+        if (!/^https?:\/\//i.test(url)) {
+            status.innerText = "⚠ Open a video page first (YouTube/Instagram/TikTok)";
+            return;
+        }
+
         status.innerText = "Downloading...";
 
-        const response = await fetch("http://127.0.0.1:8765/download", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                url: tab.url
-            })
-        });
+        const result = await chrome.runtime.sendNativeMessage(
+            "com.oneclick.downloader",
+            { url: url }
+        );
 
-        const result = await response.json();
-
-        if (result.success) {
+        if (result && result.success) {
             status.innerText = "✅ Finished";
         } else {
-            status.innerText = "❌ Download Failed";
+            status.innerText = "❌ " + ((result && result.error) || "Download Failed");
         }
 
     } catch (e) {
