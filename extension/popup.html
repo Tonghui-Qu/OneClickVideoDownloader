@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>OneClick Downloader</title>
+
+    <style>
+        body {
+            width: 280px;
+            margin: 0;
+            padding: 20px;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: white;
+        }
+
+        h2 {
+            margin-top: 0;
+            text-align: center;
+        }
+
+        button {
+            width: 100%;
+            height: 45px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background: #007AFF;
+            color: white;
+        }
+
+        button:hover {
+            background: #0062cc;
+        }
+
+        #status {
+            margin-top: 15px;
+            color: #666;
+            text-align: center;
+            font-size: 13px;
+        }
+    </style>
+</head>
+
+<body>
+
+<h2>OneClick Downloader</h2>
+
+<button id="downloadButton">
+    ⬇ Download Current Video
+</button>
+
+<div id="status">
+    Ready
+</div>
+
+<script src="popup.js"></script>
+
+</body>
+</html>
