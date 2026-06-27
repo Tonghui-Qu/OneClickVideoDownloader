@@ -98,11 +98,45 @@ def send_message(obj):
         log("SEND FAILED:\n" + traceback.format_exc())
 
 
-def download(url):
+def resolve_dir(requested):
+    """Pick the download directory. Falls back to ~/Downloads when the
+    requested folder is missing (e.g. deleted, renamed, or on an unmounted
+    drive). Returns (path, fell_back)."""
+    if requested:
+        p = Path(os.path.expanduser(requested))
+        if p.is_dir():
+            return str(p), False
+    return DOWNLOAD_DIR, bool(requested)
+
+
+def pick_folder():
+    """Show a native macOS folder chooser and return the selected path."""
+    env = build_env()
+    script = 'POSIX path of (choose folder with prompt "Select a download folder")'
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": str(e)}
+
+    if result.returncode == 0:
+        path = result.stdout.decode("utf-8").strip().rstrip("/")
+        return {"success": True, "path": path}
+
+    err = result.stderr.decode("utf-8", "replace")
+    if "User canceled" in err or "-128" in err:
+        return {"success": False, "canceled": True}
+    return {"success": False, "error": err.strip() or "Folder picker failed"}
+
+
+def download(url, requested_dir=None):
     ytdlp = find_ytdlp()
     if not ytdlp:
         return {"success": False, "error": "yt-dlp not found. Run: pip install -U yt-dlp"}
 
+    target_dir, fell_back = resolve_dir(requested_dir)
     env = build_env()
 
     cmd = [ytdlp]
@@ -115,7 +149,7 @@ def download(url):
         "--merge-output-format", "mp4",
         "--embed-thumbnail",
         "--embed-metadata",
-        "-P", DOWNLOAD_DIR,
+        "-P", target_dir,
         url,
     ]
 
@@ -126,7 +160,12 @@ def download(url):
     result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     if result.returncode == 0:
-        return {"success": True, "message": "Finished"}
+        return {
+            "success": True,
+            "message": "Finished",
+            "savedTo": target_dir,
+            "fellBack": fell_back,
+        }
 
     err = result.stderr.decode("utf-8", "replace")
     log("ERROR:\n" + err)
@@ -140,11 +179,16 @@ def main():
         log(f"received message: {msg}")
         if msg is None:
             return
+
+        if msg.get("action") == "pickFolder":
+            send_message(pick_folder())
+            return
+
         url = (msg.get("url") or "").strip()
         if not url:
             send_message({"success": False, "error": "Missing URL"})
             return
-        send_message(download(url))
+        send_message(download(url, msg.get("dir")))
     except Exception as e:  # noqa: BLE001
         log("EXCEPTION:\n" + traceback.format_exc())
         send_message({"success": False, "error": str(e)})

@@ -6,21 +6,23 @@
 
     <style>
         body {
-            width: 280px;
+            width: 300px;
             margin: 0;
-            padding: 20px;
+            padding: 18px;
             font-family: -apple-system, BlinkMacSystemFont, sans-serif;
             background: white;
+            color: #1c1c1e;
         }
 
         h2 {
-            margin-top: 0;
+            margin: 0 0 14px;
             text-align: center;
+            font-size: 17px;
         }
 
         button {
             width: 100%;
-            height: 45px;
+            height: 44px;
             font-size: 16px;
             border: none;
             border-radius: 8px;
@@ -29,15 +31,83 @@
             color: white;
         }
 
-        button:hover {
-            background: #0062cc;
+        button:hover { background: #0062cc; }
+        button:disabled { background: #b0b0b0; cursor: default; }
+
+        .section-title {
+            font-size: 12px;
+            color: #8e8e93;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            margin: 0 0 6px;
         }
 
+        #folders {
+            border: 1px solid #e5e5ea;
+            border-radius: 8px;
+            max-height: 160px;
+            overflow-y: auto;
+            margin-bottom: 8px;
+        }
+
+        .folder {
+            display: flex;
+            align-items: center;
+            padding: 8px 10px;
+            border-bottom: 1px solid #f0f0f2;
+            gap: 8px;
+        }
+        .folder:last-child { border-bottom: none; }
+
+        .folder input[type="radio"] { margin: 0; flex: 0 0 auto; }
+
+        .folder-info { flex: 1 1 auto; min-width: 0; }
+        .folder-label { font-size: 14px; font-weight: 500; }
+        .folder-path {
+            font-size: 11px;
+            color: #8e8e93;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            direction: rtl;
+            text-align: left;
+        }
+
+        .remove-btn {
+            flex: 0 0 auto;
+            width: 22px; height: 22px;
+            line-height: 20px;
+            padding: 0;
+            font-size: 15px;
+            background: transparent;
+            color: #c7c7cc;
+            border-radius: 4px;
+        }
+        .remove-btn:hover { background: #ffe5e5; color: #ff3b30; }
+
+        .empty {
+            padding: 14px 10px;
+            font-size: 13px;
+            color: #8e8e93;
+            text-align: center;
+        }
+
+        #addFolder {
+            height: 34px;
+            font-size: 13px;
+            background: #f2f2f7;
+            color: #007AFF;
+            margin-bottom: 16px;
+        }
+        #addFolder:hover { background: #e5e5ea; }
+
         #status {
-            margin-top: 15px;
+            margin-top: 14px;
             color: #666;
             text-align: center;
             font-size: 13px;
+            min-height: 16px;
+            word-break: break-word;
         }
     </style>
 </head>
@@ -46,13 +116,13 @@
 
 <h2>OneClick Video Downloader</h2>
 
-<button id="downloadButton">
-    ⬇ Download Current Video
-</button>
+<p class="section-title">Save to</p>
+<div id="folders"></div>
+<button id="addFolder">+ Add folder…</button>
 
-<div id="status">
-    Ready
-</div>
+<button id="downloadButton">⬇ Download Current Video</button>
+
+<div id="status">Ready</div>
 
 <script src="popup.js"></script>
 

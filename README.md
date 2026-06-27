@@ -83,6 +83,16 @@ What this does:
 
 That's it — you never have to start a server or run anything manually again.
 
+### Choosing where videos are saved
+
+By default videos go to `~/Downloads`. You can save them to other folders:
+
+- Click **+ Add folder…** in the popup → a native macOS folder picker opens → choose a folder. It's remembered and added to the list.
+- The list shows all your saved folders with a radio button; **the one you select is where the next download goes**.
+- Remove a saved folder with the **✕** button (the default *Downloads* entry can't be removed).
+- Your folders are remembered across browser restarts.
+- If a saved folder is later deleted/renamed or lives on an unplugged drive, the download safely **falls back to `~/Downloads`** and the popup tells you so.
+
 ---
 
 ## Updating / re-installing
