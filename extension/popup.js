@@ -12,11 +12,14 @@ const titleEl = document.getElementById("title");
 
 function showPreview(title, thumb) {
     previewEl.classList.remove("hidden", "checking");
+    // Inline style is used instead of a class because the #thumb ID selector
+    // outranks a .hidden class rule, so toggling a class wouldn't hide it.
     if (thumb) {
         thumbEl.src = thumb;
-        thumbEl.classList.remove("hidden");
+        thumbEl.style.display = "block";
     } else {
-        thumbEl.classList.add("hidden");
+        thumbEl.removeAttribute("src");
+        thumbEl.style.display = "none";
     }
     titleEl.textContent = title || "";
 }
@@ -52,7 +55,9 @@ async function probeCurrentTab() {
     showChecking();
     setStatus("");
     try {
-        const result = await chrome.runtime.sendNativeMessage(HOST, { action: "probe", url });
+        // tab.title is already in the language the user selected on the site,
+        // so the host can use it for the (localized) preview and filename.
+        const result = await chrome.runtime.sendNativeMessage(HOST, { action: "probe", url, title: tab.title || "" });
         hidePreview();
         if (result && result.ok) {
             showPreview(result.title, result.thumb);
@@ -262,7 +267,7 @@ downloadButton.addEventListener("click", async () => {
             setStatus("❌ " + (err && err.message ? err.message : "Connection closed"));
         });
 
-        port.postMessage({ url, dir });
+        port.postMessage({ url, dir, title: tab.title || "" });
     } catch (e) {
         console.error(e);
         hideProgress();

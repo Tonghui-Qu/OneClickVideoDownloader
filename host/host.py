@@ -8,6 +8,7 @@ a 4-byte little-endian length header followed by a UTF-8 JSON body.
 
 import base64
 import datetime
+import html as html_mod
 import json
 import os
 import re
@@ -18,7 +19,13 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
+import urllib.request
 from pathlib import Path
+
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36")
 
 # Dual log locations: /tmp always works regardless of HOME; the home
 # copy is convenient. Boot line is written the instant we start so we
@@ -135,7 +142,129 @@ def pick_folder():
     return {"success": False, "error": err.strip() or "Folder picker failed"}
 
 
-def probe(url):
+# When the dedicated extractor refuses or doesn't exist, these markers in the
+# error output tell us it's worth retrying with the generic extractor, which
+# scrapes the page for a plain <video>/mp4/m3u8 source. yt-dlp deliberately
+# blocks some sites (e.g. it labels them "[Piracy]"); forcing the generic
+# extractor bypasses that URL-matched block for pages that embed a real file.
+GENERIC_FALLBACK_MARKERS = (
+    "This website is no longer supported",
+    "Unsupported URL",
+    "Piracy",
+    "primarily used for piracy",
+)
+
+
+def wants_generic_fallback(err_text):
+    return any(m in err_text for m in GENERIC_FALLBACK_MARKERS)
+
+
+# --- Site-specific resolvers -------------------------------------------------
+# Some sites hide the real media URL behind obfuscated JavaScript and serve it
+# from a rotating CDN domain, so neither the dedicated nor the generic yt-dlp
+# extractor finds it. For those we scrape the page ourselves and hand yt-dlp the
+# resolved direct URL (which it downloads normally, with progress).
+
+def is_91porn(url):
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return "91porn" in host
+
+
+def resolve_91porn(url):
+    """Returns {"url": direct_mp4, "title": str, "referer": page_url} or None.
+
+    The page embeds the real <source> inside strencode2("%xx%xx...") which is
+    just URL-encoded HTML; the visible ccm.* link in the markup is a dead
+    decoy inside an HTML comment."""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": BROWSER_UA, "Referer": url})
+        page = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+    except Exception as e:
+        log(f"resolve_91porn fetch failed: {e}")
+        return None
+
+    m = re.search(r'strencode2\("([^"]+)"\)', page)
+    if not m:
+        return None
+    decoded = urllib.parse.unquote(m.group(1))
+    srcs = re.findall(r'src=[\'"]([^\'"]+\.mp4[^\'"]*)[\'"]', decoded)
+    if not srcs:
+        return None
+
+    title = ""
+    tm = re.search(r'<title>(.*?)</title>', page, re.S)
+    if tm:
+        title = _clean_91_title(tm.group(1))
+
+    # Thumbnail: prefer the social-share image, then a <video poster=...>.
+    thumb_url = None
+    om = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page, re.I)
+          or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page, re.I))
+    if om:
+        thumb_url = html_mod.unescape(om.group(1))
+    if not thumb_url:
+        pm = re.search(r'poster=[\'"]([^\'"]+)[\'"]', decoded + page)
+        if pm:
+            thumb_url = html_mod.unescape(pm.group(1))
+
+    return {"url": srcs[0], "title": title, "referer": url, "thumb_url": thumb_url}
+
+
+def _clean_91_title(raw):
+    title = _unescape_all(raw).strip()
+    return re.sub(r'\s*-\s*(?:\d+\s*)?91porn.*$', '', title, flags=re.I).strip()
+
+
+def _fetch_thumb_data_uri(thumb_url, referer=None):
+    """Downloads an image and returns it as a base64 data URI, so the popup can
+    show it without hitting CORS / hotlink protection. Returns None on failure."""
+    try:
+        headers = {"User-Agent": BROWSER_UA}
+        if referer:
+            headers["Referer"] = referer
+        req = urllib.request.Request(thumb_url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=20)
+        data = resp.read(5_000_000)
+        ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
+        if not ctype.startswith("image/"):
+            ext = Path(urllib.parse.urlparse(thumb_url).path).suffix.lower()
+            ctype = {".png": "image/png", ".webp": "image/webp",
+                     ".gif": "image/gif"}.get(ext, "image/jpeg")
+        return "data:%s;base64,%s" % (ctype, base64.b64encode(data).decode("ascii"))
+    except Exception as e:
+        log(f"thumb fetch failed: {e}")
+        return None
+
+
+def resolve_special(url):
+    """Dispatches to a site-specific resolver. Returns a dict or None."""
+    if is_91porn(url):
+        return resolve_91porn(url)
+    return None
+
+
+def _unescape_all(text):
+    """HTML-unescapes repeatedly to handle double-encoded entities
+    (e.g. '&amp;quot;' -> '&quot;' -> '\"')."""
+    for _ in range(3):
+        new = html_mod.unescape(text)
+        if new == text:
+            break
+        text = new
+    return text
+
+
+def _safe_filename(name):
+    """Strips characters that are illegal in filenames; keeps it readable."""
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]+', " ", name).strip()
+    return (name or "video")[:150]
+
+
+def probe(url, browser_title=None):
     """Checks whether a URL has a downloadable video, without downloading it.
     Returns the title and a thumbnail (as a base64 data URI, so the popup can
     show it regardless of CORS / login requirements)."""
@@ -143,52 +272,78 @@ def probe(url):
     if not ytdlp:
         return {"ok": False, "error": "yt-dlp not found"}
 
+    # Sites we resolve ourselves: if we can find the real media URL, the video
+    # is downloadable even though yt-dlp's own extractors can't see it.
+    special = resolve_special(url)
+    if special:
+        # Prefer the browser's title (already in the language the user selected
+        # on the site) over what our own cookieless fetch returns.
+        title = _clean_91_title(browser_title) if browser_title else special.get("title", "")
+        thumb = None
+        if special.get("thumb_url"):
+            thumb = _fetch_thumb_data_uri(special["thumb_url"], referer=url)
+        return {"ok": True, "title": title, "thumb": thumb}
+
     env = build_env()
-    tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
-    try:
-        cmd = [ytdlp]
-        ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
-        if ffmpeg:
-            cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
-        cmd += [
-            "--no-warnings",
-            "--skip-download",
-            "--no-simulate",  # --print alone implies simulate, which skips --write-thumbnail
-            "--no-playlist",
-            "--playlist-items", "1",
-            "--write-thumbnail",
-            "--convert-thumbnails", "jpg",
-            "--cookies-from-browser", "chrome",
-            "-P", tmp,
-            "-o", "%(id)s.%(ext)s",
-            "--print", "%(title)s",
-            url,
-        ]
+
+    def attempt(force_generic):
+        tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
         try:
-            result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=90)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "Timed out while checking"}
+            cmd = [ytdlp]
+            ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+            if ffmpeg:
+                cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
+            if force_generic:
+                cmd += ["--force-generic-extractor"]
+            cmd += [
+                "--no-warnings",
+                "--skip-download",
+                "--no-simulate",  # --print alone implies simulate, which skips --write-thumbnail
+                "--no-playlist",
+                "--playlist-items", "1",
+                "--write-thumbnail",
+                "--convert-thumbnails", "jpg",
+                "--cookies-from-browser", "chrome",
+                "-P", tmp,
+                "-o", "%(id)s.%(ext)s",
+                "--print", "%(title)s",
+                url,
+            ]
+            try:
+                result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, timeout=90)
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "error": "Timed out while checking"}
 
-        title = ""
-        if result.stdout:
-            lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
-            if lines:
-                title = lines[0]
+            title = ""
+            if result.stdout:
+                lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
+                if lines:
+                    title = lines[0]
 
-        jpgs = sorted(Path(tmp).glob("*.jpg"))
-        if result.returncode == 0 and jpgs:
-            data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
-            return {"ok": True, "title": title,
-                    "thumb": "data:image/jpeg;base64," + data}
+            jpgs = sorted(Path(tmp).glob("*.jpg"))
+            if result.returncode == 0 and jpgs:
+                data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
+                return {"ok": True, "title": title,
+                        "thumb": "data:image/jpeg;base64," + data}
 
-        # Extraction succeeded but no thumbnail, or extraction failed.
-        if result.returncode == 0:
-            return {"ok": True, "title": title, "thumb": None}
-        err = result.stderr.decode("utf-8", "replace")
-        return {"ok": False, "error": err[-300:] or "No video found"}
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+            # Extraction succeeded but no thumbnail, or extraction failed.
+            if result.returncode == 0:
+                return {"ok": True, "title": title, "thumb": None}
+            err = result.stderr.decode("utf-8", "replace")
+            return {"ok": False, "error": err or "No video found"}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    res = attempt(force_generic=False)
+    if not res.get("ok") and wants_generic_fallback(res.get("error", "")):
+        log("probe: retrying with --force-generic-extractor")
+        generic = attempt(force_generic=True)
+        if generic.get("ok"):
+            return generic
+    if not res.get("ok"):
+        res["error"] = (res.get("error") or "No video found")[-300:]
+    return res
 
 
 # yt-dlp is told to emit progress lines in this parseable form via
@@ -200,7 +355,7 @@ PROGRESS_RE = re.compile(re.escape(PROGRESS_MARKER) + r"(.*?)\|(.*?)\|(.*?)\|(.*
 STAGE_PREFIXES = ("[Merger]", "[EmbedThumbnail]", "[Metadata]", "[VideoConvertor]", "[ExtractAudio]")
 
 
-def download(url, requested_dir=None):
+def download(url, requested_dir=None, browser_title=None):
     """Runs yt-dlp and streams progress frames, then a final 'done' frame."""
     ytdlp = find_ytdlp()
     if not ytdlp:
@@ -211,67 +366,98 @@ def download(url, requested_dir=None):
     target_dir, fell_back = resolve_dir(requested_dir)
     env = build_env()
 
-    cmd = [ytdlp]
-    ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
-    if ffmpeg:
-        cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
-    cmd += [
-        "--newline",
-        "--progress-template",
-        (PROGRESS_MARKER + "%(progress._percent_str)s|%(progress._speed_str)s"
-         "|%(progress._eta_str)s|%(progress._total_bytes_str)s"),
-        "--cookies-from-browser", "chrome",
-        # Prefer the highest-resolution stream, but avoid the AV1 codec: some
-        # sites (notably Bilibili) serve AV1 from a broken CDN node that stalls
-        # mid-download ("0 bytes read, N more expected"). H.265/H.264 at the
-        # same resolution download reliably. AV1 is kept only as a last resort.
-        "-f", "bv*[vcodec!*=av01]+ba/b[vcodec!*=av01]/bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "--embed-thumbnail",
-        "--embed-metadata",
-        "-P", target_dir,
-        url,
-    ]
+    # For sites we resolve ourselves, hand yt-dlp the direct media URL (plus the
+    # page as Referer) instead of the original page URL.
+    special = resolve_special(url)
+    dl_url = special["url"] if special else url
+    referer = special.get("referer") if special else None
+    out_tmpl = "%(title)s.%(ext)s"
+    if special:
+        # Name the file after the browser's (localized) title when available,
+        # otherwise the title from our own fetch.
+        name = _clean_91_title(browser_title) if browser_title else special.get("title")
+        if name:
+            out_tmpl = _safe_filename(name) + ".%(ext)s"
 
-    log(f"RUN: {' '.join(cmd)}")
+    def run_attempt(force_generic):
+        """Runs one yt-dlp download, streaming progress. Returns (returncode,
+        tail_lines)."""
+        cmd = [ytdlp]
+        ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+        if ffmpeg:
+            cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
+        if force_generic:
+            cmd += ["--force-generic-extractor"]
+        if referer:
+            cmd += ["--add-header", f"Referer: {referer}"]
+        cmd += [
+            "--newline",
+            "--progress-template",
+            (PROGRESS_MARKER + "%(progress._percent_str)s|%(progress._speed_str)s"
+             "|%(progress._eta_str)s|%(progress._total_bytes_str)s"),
+            "--cookies-from-browser", "chrome",
+            # Prefer the highest-resolution stream, but avoid the AV1 codec: some
+            # sites (notably Bilibili) serve AV1 from a broken CDN node that stalls
+            # mid-download ("0 bytes read, N more expected"). H.265/H.264 at the
+            # same resolution download reliably. AV1 is kept only as a last resort.
+            "-f", "bv*[vcodec!*=av01]+ba/b[vcodec!*=av01]/bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "--embed-thumbnail",
+            "--embed-metadata",
+            "-P", target_dir,
+            "-o", out_tmpl,
+            dl_url,
+        ]
 
-    # Stream output line by line so we can forward progress live. stderr is
-    # merged into stdout; we keep the last lines around for error reporting.
-    proc = subprocess.Popen(
-        cmd, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
-    )
+        log(f"RUN: {' '.join(cmd)}")
 
-    tail = []
-    last_sent = 0.0
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if PROGRESS_MARKER in line:
-            m = PROGRESS_RE.search(line)
-            if m:
-                now = time.time()
-                # Throttle to ~4 updates/sec to avoid flooding the channel.
-                if now - last_sent >= 0.25:
-                    last_sent = now
-                    send_message({
-                        "type": "progress",
-                        "percent": m.group(1).strip(),
-                        "speed": m.group(2).strip(),
-                        "eta": m.group(3).strip(),
-                        "total": m.group(4).strip(),
-                    })
-            continue
+        # Stream output line by line so we can forward progress live. stderr is
+        # merged into stdout; we keep the last lines around for error reporting.
+        proc = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
 
-        tail.append(line)
-        if len(tail) > 50:
-            tail.pop(0)
-        if line.startswith(STAGE_PREFIXES):
-            send_message({"type": "status", "stage": "Processing…"})
+        tail = []
+        last_sent = 0.0
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if PROGRESS_MARKER in line:
+                m = PROGRESS_RE.search(line)
+                if m:
+                    now = time.time()
+                    # Throttle to ~4 updates/sec to avoid flooding the channel.
+                    if now - last_sent >= 0.25:
+                        last_sent = now
+                        send_message({
+                            "type": "progress",
+                            "percent": m.group(1).strip(),
+                            "speed": m.group(2).strip(),
+                            "eta": m.group(3).strip(),
+                            "total": m.group(4).strip(),
+                        })
+                continue
 
-    proc.wait()
+            tail.append(line)
+            if len(tail) > 50:
+                tail.pop(0)
+            if line.startswith(STAGE_PREFIXES):
+                send_message({"type": "status", "stage": "Processing…"})
 
-    if proc.returncode == 0:
+        proc.wait()
+        return proc.returncode, tail
+
+    returncode, tail = run_attempt(force_generic=False)
+
+    # Some sites are blocked by / missing a dedicated extractor. Retry once with
+    # the generic extractor, which can grab a plain embedded mp4/m3u8.
+    if returncode != 0 and wants_generic_fallback("\n".join(tail)):
+        log("download: retrying with --force-generic-extractor")
+        send_message({"type": "status", "stage": "Retrying…"})
+        returncode, tail = run_attempt(force_generic=True)
+
+    if returncode == 0:
         send_message({"type": "done", "success": True,
                       "savedTo": target_dir, "fellBack": fell_back})
     else:
@@ -294,14 +480,14 @@ def main():
             return
 
         if msg.get("action") == "probe":
-            send_message(probe((msg.get("url") or "").strip()))
+            send_message(probe((msg.get("url") or "").strip(), msg.get("title")))
             return
 
         url = (msg.get("url") or "").strip()
         if not url:
             send_message({"type": "done", "success": False, "error": "Missing URL"})
             return
-        download(url, msg.get("dir"))
+        download(url, msg.get("dir"), msg.get("title"))
     except Exception as e:  # noqa: BLE001
         log("EXCEPTION:\n" + traceback.format_exc())
         send_message({"type": "done", "success": False, "error": str(e)})
