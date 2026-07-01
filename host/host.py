@@ -6,13 +6,17 @@ stdin/stdout using the native messaging protocol:
 a 4-byte little-endian length header followed by a UTF-8 JSON body.
 """
 
+import base64
 import datetime
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -131,10 +135,78 @@ def pick_folder():
     return {"success": False, "error": err.strip() or "Folder picker failed"}
 
 
-def download(url, requested_dir=None):
+def probe(url):
+    """Checks whether a URL has a downloadable video, without downloading it.
+    Returns the title and a thumbnail (as a base64 data URI, so the popup can
+    show it regardless of CORS / login requirements)."""
     ytdlp = find_ytdlp()
     if not ytdlp:
-        return {"success": False, "error": "yt-dlp not found. Run: pip install -U yt-dlp"}
+        return {"ok": False, "error": "yt-dlp not found"}
+
+    env = build_env()
+    tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
+    try:
+        cmd = [ytdlp]
+        ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+        if ffmpeg:
+            cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
+        cmd += [
+            "--no-warnings",
+            "--skip-download",
+            "--no-simulate",  # --print alone implies simulate, which skips --write-thumbnail
+            "--no-playlist",
+            "--playlist-items", "1",
+            "--write-thumbnail",
+            "--convert-thumbnails", "jpg",
+            "--cookies-from-browser", "chrome",
+            "-P", tmp,
+            "-o", "%(id)s.%(ext)s",
+            "--print", "%(title)s",
+            url,
+        ]
+        try:
+            result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=90)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "Timed out while checking"}
+
+        title = ""
+        if result.stdout:
+            lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
+            if lines:
+                title = lines[0]
+
+        jpgs = sorted(Path(tmp).glob("*.jpg"))
+        if result.returncode == 0 and jpgs:
+            data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
+            return {"ok": True, "title": title,
+                    "thumb": "data:image/jpeg;base64," + data}
+
+        # Extraction succeeded but no thumbnail, or extraction failed.
+        if result.returncode == 0:
+            return {"ok": True, "title": title, "thumb": None}
+        err = result.stderr.decode("utf-8", "replace")
+        return {"ok": False, "error": err[-300:] or "No video found"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# yt-dlp is told to emit progress lines in this parseable form via
+# --progress-template. Fields: percent | speed | eta | total size.
+PROGRESS_MARKER = "__OCVD__"
+PROGRESS_RE = re.compile(re.escape(PROGRESS_MARKER) + r"(.*?)\|(.*?)\|(.*?)\|(.*)")
+
+# Post-download stages (merge/embed) that have no percentage of their own.
+STAGE_PREFIXES = ("[Merger]", "[EmbedThumbnail]", "[Metadata]", "[VideoConvertor]", "[ExtractAudio]")
+
+
+def download(url, requested_dir=None):
+    """Runs yt-dlp and streams progress frames, then a final 'done' frame."""
+    ytdlp = find_ytdlp()
+    if not ytdlp:
+        send_message({"type": "done", "success": False,
+                      "error": "yt-dlp not found. Run: brew install yt-dlp"})
+        return
 
     target_dir, fell_back = resolve_dir(requested_dir)
     env = build_env()
@@ -144,8 +216,16 @@ def download(url, requested_dir=None):
     if ffmpeg:
         cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
     cmd += [
+        "--newline",
+        "--progress-template",
+        (PROGRESS_MARKER + "%(progress._percent_str)s|%(progress._speed_str)s"
+         "|%(progress._eta_str)s|%(progress._total_bytes_str)s"),
         "--cookies-from-browser", "chrome",
-        "-f", "bv*+ba/b",
+        # Prefer the highest-resolution stream, but avoid the AV1 codec: some
+        # sites (notably Bilibili) serve AV1 from a broken CDN node that stalls
+        # mid-download ("0 bytes read, N more expected"). H.265/H.264 at the
+        # same resolution download reliably. AV1 is kept only as a last resort.
+        "-f", "bv*[vcodec!*=av01]+ba/b[vcodec!*=av01]/bv*+ba/b",
         "--merge-output-format", "mp4",
         "--embed-thumbnail",
         "--embed-metadata",
@@ -155,21 +235,50 @@ def download(url, requested_dir=None):
 
     log(f"RUN: {' '.join(cmd)}")
 
-    # Capture output so it never leaks onto stdout (which is the
-    # native messaging channel and must carry only framed JSON).
-    result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Stream output line by line so we can forward progress live. stderr is
+    # merged into stdout; we keep the last lines around for error reporting.
+    proc = subprocess.Popen(
+        cmd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
 
-    if result.returncode == 0:
-        return {
-            "success": True,
-            "message": "Finished",
-            "savedTo": target_dir,
-            "fellBack": fell_back,
-        }
+    tail = []
+    last_sent = 0.0
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if PROGRESS_MARKER in line:
+            m = PROGRESS_RE.search(line)
+            if m:
+                now = time.time()
+                # Throttle to ~4 updates/sec to avoid flooding the channel.
+                if now - last_sent >= 0.25:
+                    last_sent = now
+                    send_message({
+                        "type": "progress",
+                        "percent": m.group(1).strip(),
+                        "speed": m.group(2).strip(),
+                        "eta": m.group(3).strip(),
+                        "total": m.group(4).strip(),
+                    })
+            continue
 
-    err = result.stderr.decode("utf-8", "replace")
-    log("ERROR:\n" + err)
-    return {"success": False, "error": err[-500:] or "Download failed"}
+        tail.append(line)
+        if len(tail) > 50:
+            tail.pop(0)
+        if line.startswith(STAGE_PREFIXES):
+            send_message({"type": "status", "stage": "Processing…"})
+
+    proc.wait()
+
+    if proc.returncode == 0:
+        send_message({"type": "done", "success": True,
+                      "savedTo": target_dir, "fellBack": fell_back})
+    else:
+        err = "\n".join(tail)
+        log("ERROR:\n" + err)
+        send_message({"type": "done", "success": False,
+                      "error": err[-500:] or "Download failed"})
 
 
 def main():
@@ -184,14 +293,18 @@ def main():
             send_message(pick_folder())
             return
 
+        if msg.get("action") == "probe":
+            send_message(probe((msg.get("url") or "").strip()))
+            return
+
         url = (msg.get("url") or "").strip()
         if not url:
-            send_message({"success": False, "error": "Missing URL"})
+            send_message({"type": "done", "success": False, "error": "Missing URL"})
             return
-        send_message(download(url, msg.get("dir")))
+        download(url, msg.get("dir"))
     except Exception as e:  # noqa: BLE001
         log("EXCEPTION:\n" + traceback.format_exc())
-        send_message({"success": False, "error": str(e)})
+        send_message({"type": "done", "success": False, "error": str(e)})
 
 
 if __name__ == "__main__":

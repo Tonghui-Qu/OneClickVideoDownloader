@@ -101,8 +101,60 @@
         }
         #addFolder:hover { background: #e5e5ea; }
 
-        #status {
+        #progress {
             margin-top: 14px;
+            height: 8px;
+            background: #e5e5ea;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        #progressBar {
+            height: 100%;
+            width: 0%;
+            background: #007AFF;
+            border-radius: 4px;
+            transition: width 0.2s ease;
+        }
+        #progress.indeterminate #progressBar {
+            width: 40%;
+            animation: slide 1.1s ease-in-out infinite;
+        }
+        @keyframes slide {
+            0%   { margin-left: -40%; }
+            100% { margin-left: 100%; }
+        }
+        .hidden { display: none; }
+
+        #preview {
+            margin-bottom: 16px;
+        }
+        #thumb {
+            width: 100%;
+            border-radius: 8px;
+            display: block;
+            background: #f2f2f7;
+            aspect-ratio: 16 / 9;
+            object-fit: cover;
+        }
+        #title {
+            margin-top: 6px;
+            font-size: 13px;
+            line-height: 1.3;
+            color: #1c1c1e;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        #preview.checking {
+            text-align: center;
+            font-size: 13px;
+            color: #8e8e93;
+            padding: 10px 0;
+        }
+
+        #status {
+            margin-top: 12px;
             color: #666;
             text-align: center;
             font-size: 13px;
@@ -116,11 +168,18 @@
 
 <h2>OneClick Video Downloader</h2>
 
+<div id="preview" class="hidden">
+    <img id="thumb" alt="">
+    <div id="title"></div>
+</div>
+
 <p class="section-title">Save to</p>
 <div id="folders"></div>
 <button id="addFolder">+ Add folder…</button>
 
 <button id="downloadButton">⬇ Download Current Video</button>
+
+<div id="progress" class="hidden"><div id="progressBar"></div></div>
 
 <div id="status">Ready</div>
 
