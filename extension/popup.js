@@ -195,90 +195,148 @@ addFolderButton.addEventListener("click", async () => {
     }
 });
 
+// Rendered rows kept across updates and reused, keyed by download id. Reusing
+// the DOM (instead of rebuilding it every state broadcast) is what keeps the
+// "Starting…" indeterminate bar animating smoothly: recreating the element each
+// time — which happens ~4x/sec when another download reports progress — would
+// restart its CSS animation and make it visibly flicker.
+const dlRows = new Map();
+
+// Builds one download row and wires its buttons once. The button handlers read
+// entry.dl so they always act on the latest state without being re-bound.
+function createRow(id) {
+    const row = document.createElement("div");
+    row.className = "dl";
+
+    const main = document.createElement("div");
+    main.className = "dl-main";
+
+    const title = document.createElement("div");
+    title.className = "dl-title";
+
+    const bar = document.createElement("div");
+    bar.className = "dl-bar";
+    const fill = document.createElement("div");
+    fill.className = "dl-fill";
+    bar.appendChild(fill);
+
+    const stat = document.createElement("div");
+    stat.className = "dl-status";
+
+    main.appendChild(title);
+    main.appendChild(bar);
+    main.appendChild(stat);
+    row.appendChild(main);
+
+    const entry = { row, title, bar, fill, stat, dl: null };
+
+    // Pause (while active) or resume (while paused).
+    const toggle = document.createElement("button");
+    toggle.className = "dl-btn";
+    toggle.addEventListener("click", () => {
+        const dl = entry.dl;
+        if (!dl) return;
+        chrome.runtime.sendMessage({
+            cmd: dl.active ? "pause" : "resume", id: dl.id,
+        }).catch(() => {});
+    });
+
+    // Remove (cancels if running/paused, otherwise just dismisses).
+    const close = document.createElement("button");
+    close.className = "dl-x";
+    close.textContent = "✕";
+    close.addEventListener("click", () => {
+        chrome.runtime.sendMessage({ cmd: "remove", id }).catch(() => {});
+    });
+    row.appendChild(close);
+
+    entry.toggle = toggle;
+    entry.close = close;
+    return entry;
+}
+
+// Updates an existing row in place. Uses classList.toggle (not a wholesale
+// className reset) so a bar that stays "indeterminate" keeps the same running
+// animation across updates.
+function updateRow(entry, dl) {
+    entry.dl = dl;
+    const { title, bar, fill, stat, toggle, close, row } = entry;
+
+    title.textContent = dl.title || dl.url || "Video";
+    title.title = dl.title || dl.url || "";
+
+    const pct = (typeof dl.percent === "number" && !isNaN(dl.percent))
+        ? Math.max(0, Math.min(100, dl.percent)) : null;
+
+    const isActive = !!dl.active;
+    const isPaused = !!dl.paused;
+    const isDone = !isActive && !isPaused;
+    const isOk = isDone && !!dl.success;
+    const isErr = isDone && !dl.success;
+    const indeterminate = isActive && pct === null;
+
+    bar.classList.toggle("indeterminate", indeterminate);
+    bar.classList.toggle("paused", isPaused);
+    bar.classList.toggle("ok", isOk);
+    bar.classList.toggle("err", isErr);
+
+    // For indeterminate / finished / errored bars the width comes from CSS, so
+    // clear any inline width that would otherwise override it.
+    fill.style.width = (indeterminate || isOk || isErr)
+        ? "" : (pct !== null ? pct : 0) + "%";
+
+    stat.classList.toggle("ok", isOk);
+    stat.classList.toggle("err", isErr);
+    if (isActive) {
+        stat.textContent = dl.statusText || "Downloading…";
+    } else if (isPaused) {
+        stat.textContent = "Paused" + (pct !== null ? ` · ${pct}%` : "");
+    } else if (isOk) {
+        stat.textContent = dl.fellBack
+            ? "✅ Finished — folder missing, saved to ~/Downloads"
+            : "✅ Finished";
+    } else {
+        stat.textContent = "❌ " + (dl.error || "Download failed");
+    }
+
+    if (isActive || isPaused) {
+        toggle.textContent = isActive ? "⏸" : "▶";
+        toggle.title = isActive ? "Pause" : "Resume";
+        if (!toggle.isConnected) row.insertBefore(toggle, close);
+    } else if (toggle.isConnected) {
+        toggle.remove();
+    }
+    close.title = (isActive || isPaused) ? "Cancel" : "Dismiss";
+}
+
 // Renders the list of downloads (owned by the background worker). Several can
-// run at once; each gets its own row with independent progress.
+// run at once; each gets its own row with independent progress. Rows are reused
+// across calls (see dlRows) so in-progress animations don't restart.
 function renderDownloads(list) {
     list = Array.isArray(list) ? list : [];
     downloadsSection.classList.toggle("hidden", list.length === 0);
     clearFinishedButton.classList.toggle("hidden", !list.some((d) => d.done));
 
-    downloadsEl.innerHTML = "";
+    const seen = new Set();
+    // The list is stably ordered (oldest first), so existing rows keep their
+    // position and only brand-new rows need appending at the end.
     list.forEach((dl) => {
-        const row = document.createElement("div");
-        row.className = "dl";
-
-        const main = document.createElement("div");
-        main.className = "dl-main";
-
-        const title = document.createElement("div");
-        title.className = "dl-title";
-        title.textContent = dl.title || dl.url || "Video";
-        title.title = dl.title || dl.url || "";
-
-        const bar = document.createElement("div");
-        bar.className = "dl-bar";
-        const fill = document.createElement("div");
-        fill.className = "dl-fill";
-
-        const stat = document.createElement("div");
-        stat.className = "dl-status";
-
-        const pct = (typeof dl.percent === "number" && !isNaN(dl.percent))
-            ? Math.max(0, Math.min(100, dl.percent)) : null;
-
-        if (dl.active) {
-            if (pct !== null) fill.style.width = pct + "%";
-            else bar.classList.add("indeterminate");
-            stat.textContent = dl.statusText || "Downloading…";
-        } else if (dl.paused) {
-            bar.classList.add("paused");
-            if (pct !== null) fill.style.width = pct + "%";
-            stat.textContent = "Paused" + (pct !== null ? ` · ${pct}%` : "");
-        } else if (dl.success) {
-            bar.classList.add("ok");
-            stat.classList.add("ok");
-            stat.textContent = dl.fellBack
-                ? "✅ Finished — folder missing, saved to ~/Downloads"
-                : "✅ Finished";
-        } else {
-            bar.classList.add("err");
-            stat.classList.add("err");
-            stat.textContent = "❌ " + (dl.error || "Download failed");
+        seen.add(dl.id);
+        let entry = dlRows.get(dl.id);
+        if (!entry) {
+            entry = createRow(dl.id);
+            dlRows.set(dl.id, entry);
+            downloadsEl.appendChild(entry.row);
         }
-
-        bar.appendChild(fill);
-        main.appendChild(title);
-        main.appendChild(bar);
-        main.appendChild(stat);
-
-        row.appendChild(main);
-
-        // Pause (while active) or resume (while paused).
-        if (dl.active || dl.paused) {
-            const toggle = document.createElement("button");
-            toggle.className = "dl-btn";
-            toggle.textContent = dl.active ? "⏸" : "▶";
-            toggle.title = dl.active ? "Pause" : "Resume";
-            toggle.addEventListener("click", () => {
-                chrome.runtime.sendMessage({
-                    cmd: dl.active ? "pause" : "resume", id: dl.id,
-                }).catch(() => {});
-            });
-            row.appendChild(toggle);
-        }
-
-        // Remove (cancels if running/paused, otherwise just dismisses).
-        const close = document.createElement("button");
-        close.className = "dl-x";
-        close.textContent = "✕";
-        close.title = (dl.active || dl.paused) ? "Cancel" : "Dismiss";
-        close.addEventListener("click", () => {
-            chrome.runtime.sendMessage({ cmd: "remove", id: dl.id }).catch(() => {});
-        });
-        row.appendChild(close);
-
-        downloadsEl.appendChild(row);
+        updateRow(entry, dl);
     });
+
+    for (const [id, entry] of dlRows) {
+        if (!seen.has(id)) {
+            entry.row.remove();
+            dlRows.delete(id);
+        }
+    }
 }
 
 // Live updates from the background worker while the popup is open.

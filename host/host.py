@@ -443,9 +443,25 @@ def _safe_filename(name):
     return (name or "video")[:150]
 
 
-def _fmt_meta(resolution, fps):
-    """Formats the '1920×1080 · 60fps' line shown under the title. Missing or
-    unknown ('NA') parts are simply dropped."""
+def _human_size(n):
+    """Bytes -> human string using decimal units (MB/GB). Returns None for
+    missing/zero/unparseable values."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            # GB/TB keep one decimal; smaller units are shown as whole numbers.
+            return f"{n:.1f}{unit}" if unit in ("GB", "TB") else f"{int(round(n))}{unit}"
+        n /= 1000
+
+
+def _fmt_meta(resolution, fps, filesize=None, filesize_approx=None):
+    """Formats the '1920×1080 · 60fps · 478.4MB' line shown under the title.
+    Missing or unknown ('NA') parts are simply dropped."""
     parts = []
     if resolution and "x" in resolution.lower():
         w, _, h = resolution.lower().partition("x")
@@ -459,6 +475,9 @@ def _fmt_meta(resolution, fps):
             parts.append(f"{int(round(f))}fps")
     except (TypeError, ValueError):
         pass
+    size = _human_size(filesize) or _human_size(filesize_approx)
+    if size:
+        parts.append(size)
     return " · ".join(parts)
 
 
@@ -510,7 +529,7 @@ def probe(url, browser_title=None):
                 "-P", tmp,
                 "-o", "%(id)s.%(ext)s",
                 "--print", "%(title)s",
-                "--print", META_MARKER + "%(resolution)s|%(fps)s",
+                "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|%(filesize_approx)s",
                 url,
             ]
             try:
@@ -529,7 +548,9 @@ def probe(url, browser_title=None):
                         bits = ln[len(META_MARKER):].split("|")
                         res = bits[0] if len(bits) > 0 else ""
                         fps = bits[1] if len(bits) > 1 else ""
-                        meta = _fmt_meta(res, fps)
+                        fsize = bits[2] if len(bits) > 2 else ""
+                        fapprox = bits[3] if len(bits) > 3 else ""
+                        meta = _fmt_meta(res, fps, fsize, fapprox)
                     else:
                         non_meta.append(ln)
                 if non_meta:
@@ -832,4 +853,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Hard-exit instead of returning into normal interpreter shutdown. The
+        # control-reader daemon thread is usually blocked in a stdin read and
+        # holds the stdin buffer's lock; on Python 3.14 the finalizer's attempt
+        # to close that buffer then aborts the process ("_enter_buffered_busy",
+        # SIGABRT) — which surfaced as a "Python quit unexpectedly" dialog after
+        # a successful download. os._exit skips finalization entirely. All our
+        # messages are already flushed by send_message; flush once more for
+        # safety (stdout isn't the locked stream, so this can't deadlock).
+        try:
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
+        os._exit(0)
