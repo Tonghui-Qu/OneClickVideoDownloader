@@ -13,6 +13,76 @@ const ports = new Map();
 let nextId = 1;
 let keepAliveTimer = null;
 
+// --- Media sniffing --------------------------------------------------------
+// Per-tab captured media URLs (streaming manifests + progressive files),
+// populated passively from the moment a page loads. This is what lets us find
+// videos whose page URL carries no id (e.g. dashboards, feed modals): the
+// player still fetches an .m3u8/.mpd/.mp4 over the network, and we grab that.
+// Because the listener runs from page load, autoplay/preload requests are
+// already captured by the time the popup opens — usually no need to hit play.
+// Kept in memory; if the service worker was asleep and lost them, the page's
+// ongoing playback requests repopulate the list.
+const sniffed = new Map(); // tabId -> Map(url -> {url, kind, ts})
+const MAX_PER_TAB = 40;
+
+// URLs whose extension already reveals them as media.
+const MEDIA_URL_RE = /\.(m3u8|mpd|mp4|m4v|mov|webm)(\?|#|$)/i;
+// Media identified by response Content-Type (signed/opaque CDN URLs, API
+// endpoints) that carry no useful extension.
+const MEDIA_CT_RE = /^(application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)|video\/)/i;
+
+function classifyByUrl(url) {
+    const m = MEDIA_URL_RE.exec(url);
+    if (!m) return null;
+    const ext = m[1].toLowerCase();
+    return (ext === "m3u8" || ext === "mpd") ? "manifest" : "file";
+}
+
+function recordMedia(tabId, url, kind) {
+    if (tabId < 0 || !url) return;
+    if (url.startsWith("blob:") || url.startsWith("data:")) return;
+    let m = sniffed.get(tabId);
+    if (!m) { m = new Map(); sniffed.set(tabId, m); }
+    if (m.has(url)) return;
+    if (m.size >= MAX_PER_TAB) m.delete(m.keys().next().value); // drop oldest
+    m.set(url, { url, kind, ts: Date.now() });
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+        // A new top-level navigation means a new page: forget the old captures.
+        if (details.type === "main_frame") { sniffed.delete(details.tabId); return; }
+        const kind = classifyByUrl(details.url);
+        if (kind) recordMedia(details.tabId, details.url, kind);
+    },
+    { urls: ["<all_urls>"] }
+);
+
+chrome.webRequest.onHeadersReceived.addListener(
+    (details) => {
+        const h = (details.responseHeaders || []).find(
+            (x) => x.name.toLowerCase() === "content-type");
+        const ct = (h && h.value) || "";
+        if (MEDIA_CT_RE.test(ct)) {
+            recordMedia(details.tabId, details.url,
+                /mpegurl|dash/i.test(ct) ? "manifest" : "file");
+        }
+    },
+    { urls: ["<all_urls>"] },
+    ["responseHeaders"]
+);
+
+chrome.tabs.onRemoved.addListener((tabId) => sniffed.delete(tabId));
+
+// Returns captured candidates for a tab, manifests first (they expose the full
+// quality ladder, so yt-dlp can pick the highest rendition from them).
+function getCandidates(tabId) {
+    const m = sniffed.get(tabId);
+    if (!m) return [];
+    return Array.from(m.values())
+        .sort((a, b) => (a.kind === "manifest" ? 0 : 1) - (b.kind === "manifest" ? 0 : 1));
+}
+
 function parsePercent(str) {
     const m = /([\d.]+)\s*%/.exec(str || "");
     return m ? parseFloat(m[1]) : NaN;
@@ -107,10 +177,10 @@ function connect(id) {
         broadcast();
     });
 
-    port.postMessage({ url: s.url, dir: s.dir, title: s.title });
+    port.postMessage({ url: s.url, dir: s.dir, title: s.title, referer: s.referer });
 }
 
-function startDownload({ url, dir, title }) {
+function startDownload({ url, dir, title, referer }) {
     // Don't start a second copy of a URL that's already downloading or paused.
     for (const d of downloads.values()) {
         if ((d.active || d.paused) && d.url === url) return d.id;
@@ -120,6 +190,7 @@ function startDownload({ url, dir, title }) {
     downloads.set(id, {
         id,
         url,
+        referer: referer || "",
         dir: dir || "",
         title: title || "",
         percent: NaN,
@@ -204,6 +275,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.cmd) return; // ignore "state" broadcasts / unrelated msgs
     if (msg.cmd === "start") {
         sendResponse({ ok: true, id: startDownload(msg) });
+    } else if (msg.cmd === "getCandidates") {
+        sendResponse({ candidates: getCandidates(msg.tabId) });
     } else if (msg.cmd === "getState") {
         sendResponse({ downloads: listState() });
     } else if (msg.cmd === "pause") {

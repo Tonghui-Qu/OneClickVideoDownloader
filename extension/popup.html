@@ -9,32 +9,18 @@
             width: 300px;
             box-sizing: border-box;
             margin: 0;
-            padding: 18px;
+            padding: 14px 16px;
             font-family: -apple-system, BlinkMacSystemFont, sans-serif;
             background: white;
             color: #1c1c1e;
-            /* Fixed-height flex column: the top scrolls, the bottom (download
-               button + status + downloads) stays pinned and visible. */
-            display: flex;
-            flex-direction: column;
-            max-height: 588px;
         }
 
-        /* Scrollable upper region (preview + folder picker). */
-        #scrollArea {
-            flex: 0 1 auto;
-            min-height: 0;
-            overflow-y: auto;
-        }
-
-        /* Pinned lower region: always visible without scrolling the whole popup. */
-        #bottomBar {
-            flex: 0 0 auto;
-            padding-top: 8px;
-        }
+        /* Single-column natural flow: nothing scrolls on its own, so the whole
+           popup fits in one view (folders are always shown in full). */
+        #bottomBar { padding-top: 8px; }
 
         h2 {
-            margin: 0 0 14px;
+            margin: 0 0 12px;
             text-align: center;
             font-size: 17px;
         }
@@ -64,8 +50,6 @@
         #folders {
             border: 1px solid #e5e5ea;
             border-radius: 8px;
-            max-height: 160px;
-            overflow-y: auto;
             margin-bottom: 8px;
         }
 
@@ -116,7 +100,7 @@
             font-size: 13px;
             background: #f2f2f7;
             color: #007AFF;
-            margin-bottom: 16px;
+            margin-bottom: 10px;
         }
         #addFolder:hover { background: #e5e5ea; }
 
@@ -127,7 +111,7 @@
         .hidden { display: none; }
 
         /* Downloads list */
-        #downloadsSection { margin-top: 16px; }
+        #downloadsSection { margin-top: 10px; }
         #downloadsHeader {
             display: flex;
             align-items: baseline;
@@ -225,7 +209,7 @@
         .dl-x:hover { background: #ffe5e5; color: #ff3b30; }
 
         #preview {
-            margin-bottom: 16px;
+            margin-bottom: 10px;
         }
         #thumb {
             width: 100%;
@@ -258,7 +242,7 @@
         }
 
         #status {
-            margin-top: 12px;
+            margin-top: 8px;
             color: #666;
             text-align: center;
             font-size: 13px;

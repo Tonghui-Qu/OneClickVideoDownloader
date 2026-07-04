@@ -44,9 +44,42 @@ function hidePreview() {
     previewEl.appendChild(metaEl);
 }
 
+// What a download click should actually fetch. For sites yt-dlp knows, this is
+// the page URL (best quality via the site's extractor). When that finds nothing,
+// it becomes a sniffed media URL plus the page as its referer.
+let currentSource = null;
+
+// Ask the host to probe the media URLs the background sniffed on this page, and
+// return the best (highest-resolution) one. Used only when the page URL itself
+// isn't a recognizable video.
+async function trySniffedCandidates(tab, pageUrl) {
+    if (!tab || tab.id == null) return null;
+    let resp;
+    try {
+        resp = await chrome.runtime.sendMessage({ cmd: "getCandidates", tabId: tab.id });
+    } catch (e) {
+        return null;
+    }
+    const candidates = (resp && resp.candidates) || [];
+    if (!candidates.length) return null;
+
+    setStatus("Checking detected media…");
+    try {
+        const best = await chrome.runtime.sendNativeMessage(HOST, {
+            action: "sniffProbe",
+            url: pageUrl,
+            title: tab.title || "",
+            candidates: candidates.map((c) => c.url),
+        });
+        if (best && best.ok) return best; // { title, thumb, meta, url }
+    } catch (e) { /* fall through to "no video" */ }
+    return null;
+}
+
 async function probeCurrentTab() {
     // No downloadable video until we confirm one exists.
     downloadButton.disabled = true;
+    currentSource = null;
 
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const url = tab && tab.url ? tab.url : "";
@@ -63,9 +96,21 @@ async function probeCurrentTab() {
         // tab.title is already in the language the user selected on the site,
         // so the host can use it for the (localized) preview and filename.
         const result = await chrome.runtime.sendNativeMessage(HOST, { action: "probe", url, title: tab.title || "" });
-        hidePreview();
         if (result && result.ok) {
+            hidePreview();
             showPreview(result.title, result.thumb, result.meta);
+            currentSource = { url, referer: "" };
+            setStatus("Ready to download");
+            downloadButton.disabled = false;
+            return;
+        }
+
+        // The page URL isn't a recognizable video — fall back to sniffed media.
+        const sniffed = await trySniffedCandidates(tab, url);
+        hidePreview();
+        if (sniffed) {
+            showPreview(sniffed.title, sniffed.thumb, sniffed.meta);
+            currentSource = { url: sniffed.url, referer: url };
             setStatus("Ready to download");
             downloadButton.disabled = false;
         } else {
@@ -351,9 +396,13 @@ clearFinishedButton.addEventListener("click", () => {
 downloadButton.addEventListener("click", async () => {
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const url = tab && tab.url ? tab.url : "";
+        const pageUrl = tab && tab.url ? tab.url : "";
 
-        if (!/^https?:\/\//i.test(url)) {
+        // Prefer the source resolved during probing (may be a sniffed media URL);
+        // otherwise fall back to the page URL.
+        const src = currentSource
+            || (/^https?:\/\//i.test(pageUrl) ? { url: pageUrl, referer: "" } : null);
+        if (!src) {
             setStatus("⚠ Open a video page first (YouTube/Instagram/TikTok)");
             return;
         }
@@ -364,7 +413,8 @@ downloadButton.addEventListener("click", async () => {
         // being closed and runs alongside any others. Progress arrives via the
         // "state" broadcast above.
         await chrome.runtime.sendMessage({
-            cmd: "start", url, dir, title: tab.title || "",
+            cmd: "start", url: src.url, referer: src.referer || "",
+            dir, title: tab.title || "",
         });
         setStatus("Added to downloads ↓");
     } catch (e) {

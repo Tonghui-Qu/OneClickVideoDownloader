@@ -132,6 +132,16 @@ def normalize_url(url):
         modal = (qs.get("modal_id") or [None])[0]
         if modal and modal.isdigit():
             return f"https://www.douyin.com/video/{modal}"
+    # Weibo plays a single video in a modal on top of a profile/feed page, keeping
+    # the profile URL (e.g. /u/<uid>?...&layerid=<mid>). Handed that URL, yt-dlp's
+    # WeiboUser extractor would enumerate and download the *whole* profile's videos
+    # one after another. The layerid is the status mid, so rewrite it to the
+    # single-video URL m.weibo.cn/status/<mid> that yt-dlp treats as one video.
+    if host.endswith("weibo.com") or host.endswith("weibo.cn"):
+        qs = urllib.parse.parse_qs(parts.query)
+        layer = (qs.get("layerid") or [None])[0]
+        if layer and layer.isdigit():
+            return f"https://m.weibo.cn/status/{layer}"
     return url
 
 
@@ -347,6 +357,100 @@ def _douyin_aweme_id(url):
     return None
 
 
+def _remote_size(url, referer=None, timeout=15):
+    """Byte size of a remote file via a 1-byte Range request (reads the total
+    from Content-Range, falling back to Content-Length). Returns None on failure.
+    Used when a site's metadata blob omits the size (e.g. some Douyin videos)."""
+    try:
+        headers = {"User-Agent": MOBILE_UA, "Range": "bytes=0-0"}
+        if referer:
+            headers["Referer"] = referer
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            cr = resp.headers.get("Content-Range")  # e.g. "bytes 0-0/1234567"
+            if cr and "/" in cr:
+                total = cr.rsplit("/", 1)[1].strip()
+                if total.isdigit():
+                    return int(total)
+            cl = resp.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except Exception as e:
+        log(f"_remote_size failed: {e}")
+    return None
+
+
+def _ffprobe_info(url, referer=None, timeout=20):
+    """Reads width/height/fps from a remote video with ffprobe (only the
+    container header is needed, so it's quick for clips with a front-loaded
+    moov). Returns a dict with any of {width, height, fps}. Used to fill in
+    resolution/fps a site's metadata blob or yt-dlp couldn't provide."""
+    env = build_env()
+    ffprobe = shutil.which("ffprobe", path=env["PATH"])
+    if not ffprobe:
+        return {}
+    cmd = [ffprobe, "-v", "quiet", "-user_agent", MOBILE_UA]
+    if referer:
+        cmd += ["-headers", f"Referer: {referer}\r\n"]
+    # nokey output preserves the show_entries order: width, height, r_frame_rate.
+    cmd += ["-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-of", "default=nw=1:nk=1", url]
+    try:
+        out = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=timeout)
+        vals = out.stdout.decode("utf-8", "replace").strip().splitlines()
+        info = {}
+        if len(vals) >= 1 and vals[0].strip().isdigit():
+            info["width"] = int(vals[0].strip())
+        if len(vals) >= 2 and vals[1].strip().isdigit():
+            info["height"] = int(vals[1].strip())
+        if len(vals) >= 3:
+            r = vals[2].strip()  # e.g. "30/1"
+            try:
+                if "/" in r:
+                    num, den = r.split("/", 1)
+                    den = float(den)
+                    if den:
+                        info["fps"] = float(num) / den
+                else:
+                    info["fps"] = float(r)
+            except ValueError:
+                pass
+        return info
+    except Exception as e:
+        log(f"_ffprobe_info failed: {e}")
+        return {}
+
+
+def _frame_thumb_data_uri(url, referer=None, timeout=30):
+    """Extracts a single frame from a video with ffmpeg and returns it as a
+    base64 JPEG data URI, for previewing sniffed streams that carry no cover
+    image of their own. Returns None on failure."""
+    env = build_env()
+    ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+    if not ffmpeg:
+        return None
+    tmp = tempfile.mkdtemp(prefix="ocvd-frame-")
+    out = os.path.join(tmp, "frame.jpg")
+    try:
+        cmd = [ffmpeg, "-v", "quiet", "-user_agent", MOBILE_UA]
+        if referer:
+            cmd += ["-headers", f"Referer: {referer}\r\n"]
+        cmd += ["-ss", "0.5", "-i", url, "-frames:v", "1",
+                "-vf", "scale='min(640,iw)':-2", "-q:v", "4", "-y", out]
+        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=timeout)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            data = base64.b64encode(Path(out).read_bytes()).decode("ascii")
+            return "data:image/jpeg;base64," + data
+    except Exception as e:
+        log(f"_frame_thumb failed: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return None
+
+
 def resolve_douyin(url):
     """Returns {"url": direct_mp4, "title": str, "referer": ...} or None.
 
@@ -396,11 +500,33 @@ def resolve_douyin(url):
         if not thumb_url and cover:
             thumb_url = cover[0]
 
+        # The blob already carries dimensions/fps/size, so we can show the same
+        # resolution line the yt-dlp path shows — no extra probe needed. fps and
+        # byte size live in the per-quality bit_rate[] entries, not play_addr.
+        w = video.get("width")
+        h = video.get("height")
+        res = f"{w}x{h}" if w and h else ""
+        bit_rates = video.get("bit_rate") or []
+        first_br = bit_rates[0] if bit_rates else {}
+        fps = first_br.get("FPS") or video.get("fps")
+        data_size = (video.get("play_addr", {}) or {}).get("data_size") \
+            or (first_br.get("play_addr", {}) or {}).get("data_size")
+        # This share-page blob often omits size/fps: fetch them from the file
+        # itself (cheap: a Range request for size, ffprobe header read for fps).
+        if not data_size:
+            data_size = _remote_size(media_url, referer="https://www.douyin.com/")
+        if not fps:
+            fps = _ffprobe_info(media_url, referer="https://www.douyin.com/").get("fps")
+        log(f"resolve_douyin meta: res={res} fps={fps} size={data_size} "
+            f"br_count={len(bit_rates)}")
+        meta = _fmt_meta(res, fps, data_size)
+
         return {
             "url": media_url,
             "title": (item.get("desc") or "").strip(),
             "referer": "https://www.douyin.com/",
             "thumb_url": thumb_url,
+            "meta": meta,
         }
     except Exception as e:
         log(f"resolve_douyin parse failed: {e}")
@@ -481,9 +607,103 @@ def _fmt_meta(resolution, fps, filesize=None, filesize_approx=None):
     return " · ".join(parts)
 
 
-# Marker prefix for the resolution/fps print line, so we can pick it out of
-# yt-dlp's stdout regardless of what the title contains.
+# Marker prefixes for the metadata / direct-URL print lines, so we can pick them
+# out of yt-dlp's stdout regardless of what the title contains.
 META_MARKER = "OCVDMETA|"
+URL_MARKER = "OCVDURL|"
+
+
+def _res_height(res):
+    """Pulls the pixel height out of a 'WIDTHxHEIGHT' resolution string, for
+    ranking candidates by quality. Returns 0 when unknown."""
+    if res and "x" in res.lower():
+        try:
+            return int(res.lower().split("x")[1])
+        except (ValueError, IndexError):
+            return 0
+    return 0
+
+
+def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
+                 frame_referer=None):
+    """Runs one yt-dlp metadata probe on a URL (page, manifest, or direct file).
+    Returns {ok, title, meta, thumb, height} on success, else {ok: False, error}.
+    `height` is the pixel height of the selected stream, used to rank quality.
+    `frame_referer` is sent when falling back to ffmpeg frame extraction (some
+    CDNs, e.g. Weibo, 403 a frame grab that lacks the page Referer)."""
+    tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
+    try:
+        cmd = [ytdlp]
+        ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+        if ffmpeg:
+            cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
+        if force_generic:
+            cmd += ["--force-generic-extractor"]
+        if referer:
+            cmd += ["--add-header", f"Referer: {referer}"]
+        cmd += [
+            "--no-warnings",
+            "--skip-download",
+            "--no-simulate",  # --print alone implies simulate, which skips --write-thumbnail
+            "--no-playlist",
+            "--playlist-items", "1",
+            "--write-thumbnail",
+            "--convert-thumbnails", "jpg",
+            "--cookies-from-browser", "chrome",
+            "-P", tmp,
+            "-o", "%(id)s.%(ext)s",
+            "--print", "%(title)s",
+            "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|%(filesize_approx)s",
+            "--print", URL_MARKER + "%(url)s",
+            url,
+        ]
+        try:
+            result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "Timed out while checking"}
+
+        title = ""
+        meta = ""
+        height = 0
+        media_url = ""
+        if result.stdout:
+            lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
+            non_meta = []
+            for ln in lines:
+                if ln.startswith(META_MARKER):
+                    bits = ln[len(META_MARKER):].split("|")
+                    res = bits[0] if len(bits) > 0 else ""
+                    fps = bits[1] if len(bits) > 1 else ""
+                    fsize = bits[2] if len(bits) > 2 else ""
+                    fapprox = bits[3] if len(bits) > 3 else ""
+                    meta = _fmt_meta(res, fps, fsize, fapprox)
+                    height = _res_height(res)
+                elif ln.startswith(URL_MARKER):
+                    media_url = ln[len(URL_MARKER):].strip()
+                else:
+                    non_meta.append(ln)
+            if non_meta:
+                title = non_meta[0]
+
+        thumb = None
+        jpgs = sorted(Path(tmp).glob("*.jpg"))
+        if jpgs:
+            data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
+            thumb = "data:image/jpeg;base64," + data
+
+        if result.returncode == 0:
+            # Some extractors (e.g. Weibo) return no thumbnail; grab a frame from
+            # the stream itself so the preview still shows an image.
+            if not thumb and media_url and media_url not in ("NA", "None"):
+                thumb = _frame_thumb_data_uri(
+                    media_url, referer=referer or frame_referer)
+            return {"ok": True, "title": title, "meta": meta,
+                    "thumb": thumb, "height": height}
+        err = result.stderr.decode("utf-8", "replace")
+        return {"ok": False, "error": err or "No video found"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def probe(url, browser_title=None):
@@ -504,81 +724,66 @@ def probe(url, browser_title=None):
         thumb = None
         if special.get("thumb_url"):
             thumb = _fetch_thumb_data_uri(special["thumb_url"], referer=url)
-        return {"ok": True, "title": title, "thumb": thumb, "meta": ""}
+        return {"ok": True, "title": title, "thumb": thumb,
+                "meta": special.get("meta", "")}
 
     env = build_env()
-
-    def attempt(force_generic):
-        tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
-        try:
-            cmd = [ytdlp]
-            ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
-            if ffmpeg:
-                cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
-            if force_generic:
-                cmd += ["--force-generic-extractor"]
-            cmd += [
-                "--no-warnings",
-                "--skip-download",
-                "--no-simulate",  # --print alone implies simulate, which skips --write-thumbnail
-                "--no-playlist",
-                "--playlist-items", "1",
-                "--write-thumbnail",
-                "--convert-thumbnails", "jpg",
-                "--cookies-from-browser", "chrome",
-                "-P", tmp,
-                "-o", "%(id)s.%(ext)s",
-                "--print", "%(title)s",
-                "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|%(filesize_approx)s",
-                url,
-            ]
-            try:
-                result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, timeout=90)
-            except subprocess.TimeoutExpired:
-                return {"ok": False, "error": "Timed out while checking"}
-
-            title = ""
-            meta = ""
-            if result.stdout:
-                lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
-                non_meta = []
-                for ln in lines:
-                    if ln.startswith(META_MARKER):
-                        bits = ln[len(META_MARKER):].split("|")
-                        res = bits[0] if len(bits) > 0 else ""
-                        fps = bits[1] if len(bits) > 1 else ""
-                        fsize = bits[2] if len(bits) > 2 else ""
-                        fapprox = bits[3] if len(bits) > 3 else ""
-                        meta = _fmt_meta(res, fps, fsize, fapprox)
-                    else:
-                        non_meta.append(ln)
-                if non_meta:
-                    title = non_meta[0]
-
-            jpgs = sorted(Path(tmp).glob("*.jpg"))
-            if result.returncode == 0 and jpgs:
-                data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
-                return {"ok": True, "title": title, "meta": meta,
-                        "thumb": "data:image/jpeg;base64," + data}
-
-            # Extraction succeeded but no thumbnail, or extraction failed.
-            if result.returncode == 0:
-                return {"ok": True, "title": title, "meta": meta, "thumb": None}
-            err = result.stderr.decode("utf-8", "replace")
-            return {"ok": False, "error": err or "No video found"}
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    res = attempt(force_generic=False)
+    res = _probe_ytdlp(ytdlp, env, url, force_generic=False, frame_referer=url)
     if not res.get("ok") and wants_generic_fallback(res.get("error", "")):
         log("probe: retrying with --force-generic-extractor")
-        generic = attempt(force_generic=True)
+        generic = _probe_ytdlp(ytdlp, env, url, force_generic=True, frame_referer=url)
         if generic.get("ok"):
             return generic
     if not res.get("ok"):
         res["error"] = (res.get("error") or "No video found")[-300:]
     return res
+
+
+def _is_manifest_url(u):
+    return bool(re.search(r'\.(m3u8|mpd)(\?|#|$)', u or "", re.I))
+
+
+def sniff_probe(page_url, candidates, browser_title=None):
+    """Fallback used when the page URL itself isn't a recognizable video: probe
+    the media URLs the browser sniffed on that page and return the best one.
+
+    Manifests are tried first because they carry the whole quality ladder, so
+    yt-dlp can select the highest rendition from them — this is what lets the
+    sniffing path still reach maximum quality, not just whatever segment played.
+    Among successful probes we keep the highest resolution."""
+    ytdlp = find_ytdlp()
+    if not ytdlp:
+        return {"ok": False, "error": "yt-dlp not found"}
+    env = build_env()
+
+    # Manifests first, then progressive files; cap the work so probing stays snappy.
+    ordered = sorted(candidates or [], key=lambda u: 0 if _is_manifest_url(u) else 1)
+    best = None
+    for cand in ordered[:6]:
+        r = _probe_ytdlp(ytdlp, env, cand, referer=page_url, timeout=45)
+        log(f"sniff_probe candidate ok={r.get('ok')} h={r.get('height')} {cand[:120]}")
+        if r.get("ok"):
+            r["url"] = cand
+            if best is None or r.get("height", 0) > best.get("height", 0):
+                best = r
+    if best:
+        # The page's tab title is more meaningful than a CDN filename.
+        if browser_title:
+            best["title"] = browser_title
+        # Raw progressive CDN URLs give yt-dlp no thumbnail or dimensions, so
+        # derive them straight from the file: a frame for the preview image, and
+        # ffprobe + a size request for the resolution/fps/size line.
+        info = _ffprobe_info(best["url"], referer=page_url)
+        res = f'{info["width"]}x{info["height"]}' \
+            if info.get("width") and info.get("height") else ""
+        size = _remote_size(best["url"], referer=page_url)
+        enriched = _fmt_meta(res, info.get("fps"), size)
+        if enriched:
+            best["meta"] = enriched
+        if not best.get("thumb"):
+            best["thumb"] = _frame_thumb_data_uri(best["url"], referer=page_url)
+        return best
+    return {"ok": False, "error": "No downloadable media detected"}
 
 
 # yt-dlp is told to emit progress lines in this parseable form via
@@ -643,8 +848,8 @@ def cleanup_partials(paths=None, stems=None):
     return removed
 
 
-def download(url, requested_dir=None, browser_title=None, canceled=None,
-             cleanup=None, proc_holder=None):
+def download(url, requested_dir=None, browser_title=None, req_referer=None,
+             canceled=None, cleanup=None, proc_holder=None):
     """Runs yt-dlp and streams progress frames, then a final 'done' frame.
 
     `canceled` (threading.Event) lets the control reader stop us mid-download;
@@ -666,13 +871,19 @@ def download(url, requested_dir=None, browser_title=None, canceled=None,
     # page as Referer) instead of the original page URL.
     special = resolve_special(url)
     dl_url = special["url"] if special else url
-    referer = special.get("referer") if special else None
+    # Referer: our own resolver knows the right one; otherwise use the page URL
+    # the popup passed for a sniffed media/manifest download (CDNs often require it).
+    referer = special.get("referer") if special else req_referer
     out_tmpl = "%(title)s.%(ext)s"
     if special:
         # Name the file after the best available title (see special_title).
         name = special_title(special, browser_title)
         if name:
             out_tmpl = _safe_filename(name) + ".%(ext)s"
+    elif req_referer and browser_title:
+        # Sniffed download of a raw media/manifest URL: yt-dlp's title would be a
+        # meaningless CDN filename, so name the file after the page title.
+        out_tmpl = _safe_filename(browser_title) + ".%(ext)s"
 
     # Files/stems yt-dlp tells us it's creating, so a cancel can delete exactly
     # those (and their .part/.ytdl/thumbnail sidecars).
@@ -693,6 +904,9 @@ def download(url, requested_dir=None, browser_title=None, canceled=None,
             cmd += ["--add-header", f"Referer: {referer}"]
         cmd += [
             "--newline",
+            # Only ever the single current video: never enumerate a channel/user/
+            # feed page into a batch of downloads (e.g. a Weibo profile URL).
+            "--no-playlist",
             # Keep the partial .part file and resume it on a later run — this is
             # what makes pause/resume work. (--continue is yt-dlp's default, but
             # we set it explicitly so intent is clear.)
@@ -827,6 +1041,12 @@ def main():
             send_message(probe((msg.get("url") or "").strip(), msg.get("title")))
             return
 
+        # Fallback probe over the media URLs the browser sniffed on the page.
+        if msg.get("action") == "sniffProbe":
+            send_message(sniff_probe((msg.get("url") or "").strip(),
+                                     msg.get("candidates") or [], msg.get("title")))
+            return
+
         # Delete leftovers for a canceled download that has no running host
         # process (e.g. it was paused first). Scoped to the recorded stem.
         if msg.get("action") == "cleanup":
@@ -846,6 +1066,7 @@ def main():
         proc_holder = {}
         _start_control_reader(canceled, cleanup, proc_holder)
         download(url, msg.get("dir"), msg.get("title"),
+                 req_referer=msg.get("referer"),
                  canceled=canceled, cleanup=cleanup, proc_holder=proc_holder)
     except Exception as e:  # noqa: BLE001
         log("EXCEPTION:\n" + traceback.format_exc())
