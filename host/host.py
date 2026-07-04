@@ -630,6 +630,20 @@ META_MARKER = "OCVDMETA|"
 URL_MARKER = "OCVDURL|"
 
 
+def _estimate_size(tbr, duration):
+    """Estimates a byte size from total bitrate (kbps) × duration (s), for
+    streaming formats (HLS/DASH) whose manifests carry no exact size. Returns an
+    int or None when either input is missing/unparseable."""
+    try:
+        kbps = float(tbr)
+        secs = float(duration)
+    except (TypeError, ValueError):
+        return None
+    if kbps <= 0 or secs <= 0:
+        return None
+    return int(kbps * 1000 / 8 * secs)
+
+
 def _res_height(res):
     """Pulls the pixel height out of a 'WIDTHxHEIGHT' resolution string, for
     ranking candidates by quality. Returns 0 when unknown."""
@@ -670,7 +684,8 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             "-P", tmp,
             "-o", "%(id)s.%(ext)s",
             "--print", "%(title)s",
-            "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|%(filesize_approx)s",
+            "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|"
+            "%(filesize_approx)s|%(tbr)s|%(duration)s",
             "--print", URL_MARKER + "%(url)s",
             url,
         ]
@@ -681,7 +696,7 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             return {"ok": False, "error": "Timed out while checking"}
 
         title = ""
-        res = fps = fsize = fapprox = ""
+        res = fps = fsize = fapprox = tbr = dur = ""
         media_url = ""
         if result.stdout:
             lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
@@ -693,6 +708,8 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
                     fps = bits[1] if len(bits) > 1 else ""
                     fsize = bits[2] if len(bits) > 2 else ""
                     fapprox = bits[3] if len(bits) > 3 else ""
+                    tbr = bits[4] if len(bits) > 4 else ""
+                    dur = bits[5] if len(bits) > 5 else ""
                 elif ln.startswith(URL_MARKER):
                     media_url = ln[len(URL_MARKER):].strip()
                 else:
@@ -702,25 +719,30 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
 
         have_url = media_url and media_url not in ("NA", "None")
         # On the page-probe path (frame_referer set), some extractors omit
-        # resolution/fps/size (e.g. Twitch). Fill the gaps from the stream itself.
+        # resolution/fps/size (e.g. Twitch, xvideos). Fill the gaps ourselves.
         # (Skipped for sniff candidates so we don't probe every one — sniff_probe
         # enriches only its chosen best.)
-        if frame_referer and have_url:
+        if frame_referer:
             ref = referer or frame_referer
             need_res = not (res and "x" in res.lower())
             need_fps = not fps or fps in ("NA", "none", "None", "")
-            if need_res or need_fps:
+            if have_url and (need_res or need_fps):
                 info = _ffprobe_info(media_url, referer=ref)
                 if need_res and info.get("width") and info.get("height"):
                     res = f'{info["width"]}x{info["height"]}'
                 if need_fps and info.get("fps"):
                     fps = str(info["fps"])
-            # Size only for a direct file (a manifest's own size is meaningless).
-            if (_human_size(fsize) is None and _human_size(fapprox) is None
-                    and not _is_manifest_url(media_url)):
-                rs = _remote_size(media_url, referer=ref)
-                if rs:
-                    fsize = str(rs)
+            if _human_size(fsize) is None and _human_size(fapprox) is None:
+                # A direct file has an exact size; a manifest (HLS/DASH) doesn't,
+                # so estimate it from the total bitrate × duration instead.
+                if have_url and not _is_manifest_url(media_url):
+                    rs = _remote_size(media_url, referer=ref)
+                    if rs:
+                        fsize = str(rs)
+                if _human_size(fsize) is None:
+                    est = _estimate_size(tbr, dur)
+                    if est:
+                        fsize = str(est)
 
         meta = _fmt_meta(res, fps, fsize, fapprox)
         height = _res_height(res)
