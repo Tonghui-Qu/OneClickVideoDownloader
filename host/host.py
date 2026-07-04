@@ -13,10 +13,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.parse
@@ -131,6 +133,47 @@ def normalize_url(url):
         if modal and modal.isdigit():
             return f"https://www.douyin.com/video/{modal}"
     return url
+
+
+def _start_control_reader(canceled, cleanup, proc_holder):
+    """Watches stdin in the background during a download and stops yt-dlp when
+    asked. Two flavors of stop:
+
+    - Pause (Chrome closes the port -> EOF, or an explicit "pause"/"stop"): the
+      partial `.part` file is kept so a later run can resume it with --continue.
+    - Cancel (an explicit {"action":"cancel","cleanup":true} message sent just
+      before the port is dropped): also flag `cleanup` so the leftover partial
+      files get deleted once yt-dlp has exited."""
+    def stop_proc():
+        proc = proc_holder.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    def reader():
+        while True:
+            try:
+                msg = read_message()
+            except Exception:
+                msg = None
+            if msg is None:
+                canceled.set()
+                stop_proc()
+                return
+            if isinstance(msg, dict) and msg.get("action") in ("cancel", "pause", "stop"):
+                if msg.get("action") == "cancel" and msg.get("cleanup"):
+                    cleanup.set()
+                canceled.set()
+                stop_proc()
+                return
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    return thread
 
 
 def resolve_dir(requested):
@@ -490,9 +533,68 @@ PROGRESS_RE = re.compile(re.escape(PROGRESS_MARKER) + r"(.*?)\|(.*?)\|(.*?)\|(.*
 # Post-download stages (merge/embed) that have no percentage of their own.
 STAGE_PREFIXES = ("[Merger]", "[EmbedThumbnail]", "[Metadata]", "[VideoConvertor]", "[ExtractAudio]")
 
+# Lines yt-dlp prints when it decides on an output file. We record these so a
+# canceled download can delete exactly what it created (the streams, the merged
+# file, the sidecar thumbnail, and any leftover .part/.ytdl fragments).
+DEST_RE = re.compile(r'\[download\]\s+Destination:\s*(.+?)\s*$')
+MERGE_RE = re.compile(r'Merging formats into\s+"(.+?)"\s*$')
 
-def download(url, requested_dir=None, browser_title=None):
-    """Runs yt-dlp and streams progress frames, then a final 'done' frame."""
+# Suffixes of transient files that are safe to sweep away for a stem we own.
+TEMP_SUFFIXES = (".part", ".ytdl", ".temp")
+THUMB_SUFFIXES = (".webp", ".jpg", ".jpeg", ".png")
+
+
+def _try_unlink(path, removed):
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+            removed.append(path)
+    except Exception as e:  # noqa: BLE001
+        log(f"cleanup: could not remove {path}: {e}")
+
+
+def _stem_of(path):
+    """Reduces an output path to its title stem: strips the extension and
+    yt-dlp's per-format id (e.g. '/dir/Title.f251.webm' -> '/dir/Title')."""
+    p = Path(path)
+    name = re.sub(r'\.part$', '', p.name)
+    name = re.sub(r'\.[^.]+$', '', name)   # extension
+    name = re.sub(r'\.f\d+$', '', name)    # yt-dlp format id
+    return str(p.parent / name)
+
+
+def cleanup_partials(paths=None, stems=None):
+    """Deletes partial-download artifacts. `paths` are exact files we recorded
+    (streams / merged output); `stems` drive a scoped sweep for leftover
+    .part/.ytdl/fragment files and sidecar thumbnails. Scoping to our own stems
+    means we never touch unrelated files in the folder."""
+    import glob as globmod
+    removed = []
+    for p in (paths or []):
+        for cand in (p, p + ".part", p + ".ytdl"):
+            _try_unlink(cand, removed)
+        for frag in globmod.glob(globmod.escape(p) + ".part-Frag*"):
+            _try_unlink(frag, removed)
+    for stem in (stems or []):
+        if not stem:
+            continue
+        base = globmod.escape(stem)
+        for suf in TEMP_SUFFIXES + THUMB_SUFFIXES:
+            for f in globmod.glob(base + "*" + suf):
+                _try_unlink(f, removed)
+        for f in globmod.glob(base + "*.part-Frag*"):
+            _try_unlink(f, removed)
+    return removed
+
+
+def download(url, requested_dir=None, browser_title=None, canceled=None,
+             cleanup=None, proc_holder=None):
+    """Runs yt-dlp and streams progress frames, then a final 'done' frame.
+
+    `canceled` (threading.Event) lets the control reader stop us mid-download;
+    `cleanup` (threading.Event) additionally means the user canceled and wants
+    the partial files deleted (vs. a pause, which keeps them for resume);
+    `proc_holder` is a dict the reader uses to reach the live subprocess."""
     ytdlp = find_ytdlp()
     if not ytdlp:
         send_message({"type": "done", "success": False,
@@ -516,6 +618,12 @@ def download(url, requested_dir=None, browser_title=None):
         if name:
             out_tmpl = _safe_filename(name) + ".%(ext)s"
 
+    # Files/stems yt-dlp tells us it's creating, so a cancel can delete exactly
+    # those (and their .part/.ytdl/thumbnail sidecars).
+    created = set()
+    stems = set()
+    meta_sent = [False]
+
     def run_attempt(force_generic):
         """Runs one yt-dlp download, streaming progress. Returns (returncode,
         tail_lines)."""
@@ -529,6 +637,10 @@ def download(url, requested_dir=None, browser_title=None):
             cmd += ["--add-header", f"Referer: {referer}"]
         cmd += [
             "--newline",
+            # Keep the partial .part file and resume it on a later run — this is
+            # what makes pause/resume work. (--continue is yt-dlp's default, but
+            # we set it explicitly so intent is clear.)
+            "--continue",
             "--progress-template",
             (PROGRESS_MARKER + "%(progress._percent_str)s|%(progress._speed_str)s"
              "|%(progress._eta_str)s|%(progress._total_bytes_str)s"),
@@ -550,15 +662,21 @@ def download(url, requested_dir=None, browser_title=None):
 
         # Stream output line by line so we can forward progress live. stderr is
         # merged into stdout; we keep the last lines around for error reporting.
+        # start_new_session gives the child its own process group so the control
+        # reader can kill it (and any ffmpeg children) cleanly on pause/cancel.
         proc = subprocess.Popen(
             cmd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, start_new_session=True,
         )
+        if proc_holder is not None:
+            proc_holder["proc"] = proc
 
         tail = []
         last_sent = 0.0
         for line in proc.stdout:
+            if canceled is not None and canceled.is_set():
+                break
             line = line.rstrip("\n")
             if PROGRESS_MARKER in line:
                 m = PROGRESS_RE.search(line)
@@ -579,13 +697,43 @@ def download(url, requested_dir=None, browser_title=None):
             tail.append(line)
             if len(tail) > 50:
                 tail.pop(0)
+
+            # Record output files so a cancel can remove them. Also relay the
+            # stem to the extension once, so it can clean up a *paused* download
+            # later (when no host process is running to do it itself).
+            md = DEST_RE.search(line) or MERGE_RE.search(line)
+            if md:
+                fp = md.group(1).strip()
+                created.add(fp)
+                stem = _stem_of(fp)
+                stems.add(stem)
+                if not meta_sent[0]:
+                    meta_sent[0] = True
+                    send_message({"type": "meta", "stem": stem})
+
             if line.startswith(STAGE_PREFIXES):
                 send_message({"type": "status", "stage": "Processing…"})
 
         proc.wait()
         return proc.returncode, tail
 
+    def _finish_canceled():
+        """yt-dlp was stopped by the user. On a cancel we delete the leftovers;
+        on a pause we keep the .part file so a later run can resume it."""
+        if cleanup is not None and cleanup.is_set():
+            removed = cleanup_partials(paths=created, stems=stems)
+            log(f"download: canceled, removed {len(removed)} partial file(s): {removed}")
+        else:
+            log("download: paused, partial file kept for resume")
+
     returncode, tail = run_attempt(force_generic=False)
+
+    # Stopped by the user (pause/cancel) or by Chrome closing the port: don't
+    # report a bogus failure — the popup already knows the new state, and the
+    # port is usually gone anyway.
+    if canceled is not None and canceled.is_set():
+        _finish_canceled()
+        return
 
     # Some sites are blocked by / missing a dedicated extractor. Retry once with
     # the generic extractor, which can grab a plain embedded mp4/m3u8.
@@ -593,6 +741,9 @@ def download(url, requested_dir=None, browser_title=None):
         log("download: retrying with --force-generic-extractor")
         send_message({"type": "status", "stage": "Retrying…"})
         returncode, tail = run_attempt(force_generic=True)
+        if canceled is not None and canceled.is_set():
+            _finish_canceled()
+            return
 
     if returncode == 0:
         send_message({"type": "done", "success": True,
@@ -620,11 +771,26 @@ def main():
             send_message(probe((msg.get("url") or "").strip(), msg.get("title")))
             return
 
+        # Delete leftovers for a canceled download that has no running host
+        # process (e.g. it was paused first). Scoped to the recorded stem.
+        if msg.get("action") == "cleanup":
+            removed = cleanup_partials(stems=[msg.get("stem")])
+            log(f"cleanup action removed {len(removed)} file(s): {removed}")
+            send_message({"type": "cleaned", "removed": removed})
+            return
+
         url = (msg.get("url") or "").strip()
         if not url:
             send_message({"type": "done", "success": False, "error": "Missing URL"})
             return
-        download(url, msg.get("dir"), msg.get("title"))
+        # Watch stdin so a paused/canceled download actually stops yt-dlp.
+        # `cleanup` distinguishes a cancel (delete partials) from a pause (keep).
+        canceled = threading.Event()
+        cleanup = threading.Event()
+        proc_holder = {}
+        _start_control_reader(canceled, cleanup, proc_holder)
+        download(url, msg.get("dir"), msg.get("title"),
+                 canceled=canceled, cleanup=cleanup, proc_holder=proc_holder)
     except Exception as e:  # noqa: BLE001
         log("EXCEPTION:\n" + traceback.format_exc())
         send_message({"type": "done", "success": False, "error": str(e)})

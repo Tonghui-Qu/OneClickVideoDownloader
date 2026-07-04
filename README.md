@@ -83,7 +83,7 @@ What this does:
 
 That's it — you never have to start a server or run anything manually again.
 
-> **Closing the popup won't cancel a download.** The download runs in the extension's background service worker, so you can close the popup (or click away) and it keeps going. Reopen the popup any time to see live progress or the final result.
+> **Downloads run in the background, several can run at once, and each can be paused.** Each download runs in the extension's background service worker, so you can close the popup (or click away) and it keeps going. Open more video tabs and click download on each to run them in parallel. Reopen the popup any time to see a live list with per-video progress. Each row has **⏸ Pause** / **▶ Resume** (resume continues the partial file, it doesn't restart) and **✕** to cancel/dismiss; **Clear finished** tidies the list.
 
 ### Choosing where videos are saved
 

@@ -4,11 +4,12 @@ const status = document.getElementById("status");
 const downloadButton = document.getElementById("downloadButton");
 const addFolderButton = document.getElementById("addFolder");
 const foldersEl = document.getElementById("folders");
-const progressEl = document.getElementById("progress");
-const progressBar = document.getElementById("progressBar");
 const previewEl = document.getElementById("preview");
 const thumbEl = document.getElementById("thumb");
 const titleEl = document.getElementById("title");
+const downloadsSection = document.getElementById("downloadsSection");
+const downloadsEl = document.getElementById("downloads");
+const clearFinishedButton = document.getElementById("clearFinished");
 
 function showPreview(title, thumb) {
     previewEl.classList.remove("hidden", "checking");
@@ -70,23 +71,6 @@ async function probeCurrentTab() {
         hidePreview();
         setStatus("❌ " + e.message);
     }
-}
-
-function showProgress(percent) {
-    progressEl.classList.remove("hidden");
-    if (typeof percent === "number" && !isNaN(percent)) {
-        progressEl.classList.remove("indeterminate");
-        progressBar.style.width = Math.max(0, Math.min(100, percent)) + "%";
-    } else {
-        // Unknown size / post-processing: show an animated indeterminate bar.
-        progressEl.classList.add("indeterminate");
-    }
-}
-
-function hideProgress() {
-    progressEl.classList.add("hidden");
-    progressEl.classList.remove("indeterminate");
-    progressBar.style.width = "0%";
 }
 
 // path "" is the special default entry → host saves to ~/Downloads.
@@ -207,36 +191,103 @@ addFolderButton.addEventListener("click", async () => {
     }
 });
 
-// Reflects a download's state (owned by the background worker) onto the UI.
-// Called both for live broadcasts and to restore the view when the popup opens.
-function applyDownloadState(dl) {
-    if (!dl) return;
-    if (dl.active) {
-        downloadButton.disabled = true;
-        showProgress(typeof dl.percent === "number" && !isNaN(dl.percent) ? dl.percent : NaN);
-        setStatus(dl.statusText || "Downloading…");
-    } else if (dl.done) {
-        hideProgress();
-        downloadButton.disabled = false;
-        if (dl.success) {
-            setStatus(dl.fellBack
+// Renders the list of downloads (owned by the background worker). Several can
+// run at once; each gets its own row with independent progress.
+function renderDownloads(list) {
+    list = Array.isArray(list) ? list : [];
+    downloadsSection.classList.toggle("hidden", list.length === 0);
+    clearFinishedButton.classList.toggle("hidden", !list.some((d) => d.done));
+
+    downloadsEl.innerHTML = "";
+    list.forEach((dl) => {
+        const row = document.createElement("div");
+        row.className = "dl";
+
+        const main = document.createElement("div");
+        main.className = "dl-main";
+
+        const title = document.createElement("div");
+        title.className = "dl-title";
+        title.textContent = dl.title || dl.url || "Video";
+        title.title = dl.title || dl.url || "";
+
+        const bar = document.createElement("div");
+        bar.className = "dl-bar";
+        const fill = document.createElement("div");
+        fill.className = "dl-fill";
+
+        const stat = document.createElement("div");
+        stat.className = "dl-status";
+
+        const pct = (typeof dl.percent === "number" && !isNaN(dl.percent))
+            ? Math.max(0, Math.min(100, dl.percent)) : null;
+
+        if (dl.active) {
+            if (pct !== null) fill.style.width = pct + "%";
+            else bar.classList.add("indeterminate");
+            stat.textContent = dl.statusText || "Downloading…";
+        } else if (dl.paused) {
+            bar.classList.add("paused");
+            if (pct !== null) fill.style.width = pct + "%";
+            stat.textContent = "Paused" + (pct !== null ? ` · ${pct}%` : "");
+        } else if (dl.success) {
+            bar.classList.add("ok");
+            stat.classList.add("ok");
+            stat.textContent = dl.fellBack
                 ? "✅ Finished — folder missing, saved to ~/Downloads"
-                : "✅ Finished");
+                : "✅ Finished";
         } else {
-            setStatus("❌ " + (dl.error || "Download Failed"));
+            bar.classList.add("err");
+            stat.classList.add("err");
+            stat.textContent = "❌ " + (dl.error || "Download failed");
         }
-    }
+
+        bar.appendChild(fill);
+        main.appendChild(title);
+        main.appendChild(bar);
+        main.appendChild(stat);
+
+        row.appendChild(main);
+
+        // Pause (while active) or resume (while paused).
+        if (dl.active || dl.paused) {
+            const toggle = document.createElement("button");
+            toggle.className = "dl-btn";
+            toggle.textContent = dl.active ? "⏸" : "▶";
+            toggle.title = dl.active ? "Pause" : "Resume";
+            toggle.addEventListener("click", () => {
+                chrome.runtime.sendMessage({
+                    cmd: dl.active ? "pause" : "resume", id: dl.id,
+                }).catch(() => {});
+            });
+            row.appendChild(toggle);
+        }
+
+        // Remove (cancels if running/paused, otherwise just dismisses).
+        const close = document.createElement("button");
+        close.className = "dl-x";
+        close.textContent = "✕";
+        close.title = (dl.active || dl.paused) ? "Cancel" : "Dismiss";
+        close.addEventListener("click", () => {
+            chrome.runtime.sendMessage({ cmd: "remove", id: dl.id }).catch(() => {});
+        });
+        row.appendChild(close);
+
+        downloadsEl.appendChild(row);
+    });
 }
 
 // Live updates from the background worker while the popup is open.
 chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "state") applyDownloadState(msg.state);
+    if (msg && msg.type === "state") renderDownloads(msg.downloads);
+});
+
+clearFinishedButton.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ cmd: "clearFinished" }).catch(() => {});
 });
 
 downloadButton.addEventListener("click", async () => {
     try {
-        setStatus("Getting current page…");
-
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         const url = tab && tab.url ? tab.url : "";
 
@@ -248,18 +299,14 @@ downloadButton.addEventListener("click", async () => {
         const dir = (folders[selected] && folders[selected].path) || "";
 
         // Hand the download to the background worker so it survives this popup
-        // being closed. Progress arrives via the "state" broadcast above.
-        setStatus("Starting…");
-        showProgress(NaN);
-        downloadButton.disabled = true;
-
+        // being closed and runs alongside any others. Progress arrives via the
+        // "state" broadcast above.
         await chrome.runtime.sendMessage({
             cmd: "start", url, dir, title: tab.title || "",
         });
+        setStatus("Added to downloads ↓");
     } catch (e) {
         console.error(e);
-        hideProgress();
-        downloadButton.disabled = false;
         setStatus("❌ " + e.message);
     }
 });
@@ -268,22 +315,12 @@ downloadButton.addEventListener("click", async () => {
     await loadState();
     render();
 
-    // If a download is already running (popup was reopened mid-download), show
-    // its live progress instead of probing the current tab.
-    let dl = null;
+    // Restore any in-flight / finished downloads so reopening the popup shows
+    // their live progress and results.
     try {
         const resp = await chrome.runtime.sendMessage({ cmd: "getState" });
-        dl = resp && resp.state;
-    } catch (e) { /* worker not ready; fall through to probe */ }
+        renderDownloads(resp && resp.downloads);
+    } catch (e) { /* worker not ready yet */ }
 
-    if (dl && dl.active) {
-        applyDownloadState(dl);
-        return;
-    }
-    if (dl && dl.done) {
-        // Show the last result, then clear it so it isn't shown again later.
-        applyDownloadState(dl);
-        chrome.runtime.sendMessage({ cmd: "clearFinished" }).catch(() => {});
-    }
     probeCurrentTab();
 })();

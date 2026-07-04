@@ -7,11 +7,30 @@
     <style>
         body {
             width: 300px;
+            box-sizing: border-box;
             margin: 0;
             padding: 18px;
             font-family: -apple-system, BlinkMacSystemFont, sans-serif;
             background: white;
             color: #1c1c1e;
+            /* Fixed-height flex column: the top scrolls, the bottom (download
+               button + status + downloads) stays pinned and visible. */
+            display: flex;
+            flex-direction: column;
+            max-height: 588px;
+        }
+
+        /* Scrollable upper region (preview + folder picker). */
+        #scrollArea {
+            flex: 0 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+        }
+
+        /* Pinned lower region: always visible without scrolling the whole popup. */
+        #bottomBar {
+            flex: 0 0 auto;
+            padding-top: 8px;
         }
 
         h2 {
@@ -101,29 +120,109 @@
         }
         #addFolder:hover { background: #e5e5ea; }
 
-        #progress {
-            margin-top: 14px;
-            height: 8px;
-            background: #e5e5ea;
-            border-radius: 4px;
-            overflow: hidden;
-        }
-        #progressBar {
-            height: 100%;
-            width: 0%;
-            background: #007AFF;
-            border-radius: 4px;
-            transition: width 0.2s ease;
-        }
-        #progress.indeterminate #progressBar {
-            width: 40%;
-            animation: slide 1.1s ease-in-out infinite;
-        }
         @keyframes slide {
             0%   { margin-left: -40%; }
             100% { margin-left: 100%; }
         }
         .hidden { display: none; }
+
+        /* Downloads list */
+        #downloadsSection { margin-top: 16px; }
+        #downloadsHeader {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            margin-bottom: 6px;
+        }
+        #clearFinished {
+            width: auto;
+            height: auto;
+            padding: 0;
+            font-size: 12px;
+            background: transparent;
+            color: #007AFF;
+        }
+        #clearFinished:hover { background: transparent; text-decoration: underline; }
+
+        #downloads {
+            border: 1px solid #e5e5ea;
+            border-radius: 8px;
+            max-height: 220px;
+            overflow-y: auto;
+        }
+
+        .dl {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-bottom: 1px solid #f0f0f2;
+        }
+        .dl:last-child { border-bottom: none; }
+
+        .dl-main { flex: 1 1 auto; min-width: 0; }
+        .dl-title {
+            font-size: 13px;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .dl-bar {
+            margin: 5px 0 4px;
+            height: 6px;
+            background: #e5e5ea;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .dl-fill {
+            height: 100%;
+            width: 0%;
+            background: #007AFF;
+            border-radius: 3px;
+            transition: width 0.2s ease;
+        }
+        .dl-bar.indeterminate .dl-fill {
+            width: 40%;
+            animation: slide 1.1s ease-in-out infinite;
+        }
+        .dl-bar.ok .dl-fill { width: 100%; background: #34c759; }
+        .dl-bar.err .dl-fill { width: 100%; background: #ff3b30; }
+        .dl-bar.paused .dl-fill { background: #ff9500; }
+
+        .dl-status {
+            font-size: 11px;
+            color: #8e8e93;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .dl-status.ok { color: #34c759; }
+        .dl-status.err { color: #ff3b30; }
+
+        .dl-btn {
+            flex: 0 0 auto;
+            width: 24px; height: 24px;
+            line-height: 22px;
+            padding: 0;
+            font-size: 13px;
+            background: transparent;
+            color: #8e8e93;
+            border-radius: 4px;
+        }
+        .dl-btn:hover { background: #e5f0ff; color: #007AFF; }
+
+        .dl-x {
+            flex: 0 0 auto;
+            width: 24px; height: 24px;
+            line-height: 22px;
+            padding: 0;
+            font-size: 15px;
+            background: transparent;
+            color: #c7c7cc;
+            border-radius: 4px;
+        }
+        .dl-x:hover { background: #ffe5e5; color: #ff3b30; }
 
         #preview {
             margin-bottom: 16px;
@@ -168,20 +267,30 @@
 
 <h2>OneClick Video Downloader</h2>
 
-<div id="preview" class="hidden">
-    <img id="thumb" alt="">
-    <div id="title"></div>
+<div id="scrollArea">
+    <div id="preview" class="hidden">
+        <img id="thumb" alt="">
+        <div id="title"></div>
+    </div>
+
+    <p class="section-title">Save to</p>
+    <div id="folders"></div>
+    <button id="addFolder">+ Add folder…</button>
 </div>
 
-<p class="section-title">Save to</p>
-<div id="folders"></div>
-<button id="addFolder">+ Add folder…</button>
+<div id="bottomBar">
+    <button id="downloadButton">⬇ Download Current Video</button>
 
-<button id="downloadButton">⬇ Download Current Video</button>
+    <div id="status">Ready</div>
 
-<div id="progress" class="hidden"><div id="progressBar"></div></div>
-
-<div id="status">Ready</div>
+    <div id="downloadsSection" class="hidden">
+        <div id="downloadsHeader">
+            <p class="section-title" style="margin:0;">Downloads</p>
+            <button id="clearFinished">Clear finished</button>
+        </div>
+        <div id="downloads"></div>
+    </div>
+</div>
 
 <script src="popup.js"></script>
 
