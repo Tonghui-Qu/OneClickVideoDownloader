@@ -74,13 +74,18 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.tabs.onRemoved.addListener((tabId) => sniffed.delete(tabId));
 
-// Returns captured candidates for a tab, manifests first (they expose the full
-// quality ladder, so yt-dlp can pick the highest rendition from them).
+// Returns captured candidates for a tab. Manifests come first (they expose the
+// full quality ladder, so yt-dlp can pick the highest rendition). Within each
+// group the newest are first: CDN media URLs (e.g. Douyin) carry short-lived,
+// often single-use tokens, so the most recently seen one is the most likely to
+// still be valid — probing stale ones first just stalls until they time out.
 function getCandidates(tabId) {
     const m = sniffed.get(tabId);
     if (!m) return [];
-    return Array.from(m.values())
-        .sort((a, b) => (a.kind === "manifest" ? 0 : 1) - (b.kind === "manifest" ? 0 : 1));
+    return Array.from(m.values()).sort((a, b) => {
+        const byKind = (a.kind === "manifest" ? 0 : 1) - (b.kind === "manifest" ? 0 : 1);
+        return byKind !== 0 ? byKind : b.ts - a.ts;
+    });
 }
 
 function parsePercent(str) {

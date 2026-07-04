@@ -212,12 +212,18 @@
             margin-bottom: 10px;
         }
         #thumb {
-            width: 100%;
-            border-radius: 8px;
             display: block;
+            margin: 0 auto;
+            max-width: 100%;
+            height: auto;
+            /* Show the whole frame at the video's own aspect ratio (no crop).
+               Cap tall (portrait) videos at ~2/3 of their full-width height so
+               they don't dominate the popup — the image scales down and stays
+               centered (no side bars). Landscape frames stay shorter and are
+               unaffected. */
+            max-height: 318px;
+            border-radius: 8px;
             background: #f2f2f7;
-            aspect-ratio: 16 / 9;
-            object-fit: cover;
         }
         #title {
             margin-top: 6px;

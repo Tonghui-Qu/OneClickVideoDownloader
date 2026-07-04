@@ -322,6 +322,12 @@ MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) "
              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
              "Version/15.0 Mobile/15E148 Safari/604.1")
 
+# Desktop UA for ffmpeg/ffprobe fetches: the media was requested by desktop
+# Chrome, and some CDNs (e.g. Cloudflare-fronted ones) reject a mobile UA.
+DESKTOP_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/125.0.0.0 Safari/537.36")
+
 
 def is_douyin(url):
     try:
@@ -362,7 +368,7 @@ def _remote_size(url, referer=None, timeout=15):
     from Content-Range, falling back to Content-Length). Returns None on failure.
     Used when a site's metadata blob omits the size (e.g. some Douyin videos)."""
     try:
-        headers = {"User-Agent": MOBILE_UA, "Range": "bytes=0-0"}
+        headers = {"User-Agent": DESKTOP_UA, "Range": "bytes=0-0"}
         if referer:
             headers["Referer"] = referer
         req = urllib.request.Request(url, headers=headers)
@@ -389,7 +395,7 @@ def _ffprobe_info(url, referer=None, timeout=20):
     ffprobe = shutil.which("ffprobe", path=env["PATH"])
     if not ffprobe:
         return {}
-    cmd = [ffprobe, "-v", "quiet", "-user_agent", MOBILE_UA]
+    cmd = [ffprobe, "-v", "quiet", "-user_agent", DESKTOP_UA]
     if referer:
         cmd += ["-headers", f"Referer: {referer}\r\n"]
     # nokey output preserves the show_entries order: width, height, r_frame_rate.
@@ -434,7 +440,7 @@ def _frame_thumb_data_uri(url, referer=None, timeout=30):
     tmp = tempfile.mkdtemp(prefix="ocvd-frame-")
     out = os.path.join(tmp, "frame.jpg")
     try:
-        cmd = [ffmpeg, "-v", "quiet", "-user_agent", MOBILE_UA]
+        cmd = [ffmpeg, "-v", "quiet", "-user_agent", DESKTOP_UA]
         if referer:
             cmd += ["-headers", f"Referer: {referer}\r\n"]
         cmd += ["-ss", "0.5", "-i", url, "-frames:v", "1",
@@ -563,6 +569,17 @@ def _unescape_all(text):
     return text
 
 
+def _strip_hashtags(text):
+    """Removes social hashtags from a title so they don't clutter filenames.
+    Handles both the trailing/inline '#tag' form and the wrapped '#话题#' form
+    (Douyin/Weibo). Leaves the rest of the caption intact."""
+    if not text:
+        return text
+    text = re.sub(r'#[^#\s]+#', " ", text)   # wrapped:  #话题#
+    text = re.sub(r'#\S+', " ", text)         # inline/trailing:  #jiojio
+    return re.sub(r'\s+', " ", text).strip()
+
+
 def _safe_filename(name):
     """Strips characters that are illegal in filenames; keeps it readable."""
     name = re.sub(r'[\\/:*?"<>|\n\r\t]+', " ", name).strip()
@@ -664,8 +681,7 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             return {"ok": False, "error": "Timed out while checking"}
 
         title = ""
-        meta = ""
-        height = 0
+        res = fps = fsize = fapprox = ""
         media_url = ""
         if result.stdout:
             lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
@@ -677,14 +693,37 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
                     fps = bits[1] if len(bits) > 1 else ""
                     fsize = bits[2] if len(bits) > 2 else ""
                     fapprox = bits[3] if len(bits) > 3 else ""
-                    meta = _fmt_meta(res, fps, fsize, fapprox)
-                    height = _res_height(res)
                 elif ln.startswith(URL_MARKER):
                     media_url = ln[len(URL_MARKER):].strip()
                 else:
                     non_meta.append(ln)
             if non_meta:
                 title = non_meta[0]
+
+        have_url = media_url and media_url not in ("NA", "None")
+        # On the page-probe path (frame_referer set), some extractors omit
+        # resolution/fps/size (e.g. Twitch). Fill the gaps from the stream itself.
+        # (Skipped for sniff candidates so we don't probe every one — sniff_probe
+        # enriches only its chosen best.)
+        if frame_referer and have_url:
+            ref = referer or frame_referer
+            need_res = not (res and "x" in res.lower())
+            need_fps = not fps or fps in ("NA", "none", "None", "")
+            if need_res or need_fps:
+                info = _ffprobe_info(media_url, referer=ref)
+                if need_res and info.get("width") and info.get("height"):
+                    res = f'{info["width"]}x{info["height"]}'
+                if need_fps and info.get("fps"):
+                    fps = str(info["fps"])
+            # Size only for a direct file (a manifest's own size is meaningless).
+            if (_human_size(fsize) is None and _human_size(fapprox) is None
+                    and not _is_manifest_url(media_url)):
+                rs = _remote_size(media_url, referer=ref)
+                if rs:
+                    fsize = str(rs)
+
+        meta = _fmt_meta(res, fps, fsize, fapprox)
+        height = _res_height(res)
 
         thumb = None
         jpgs = sorted(Path(tmp).glob("*.jpg"))
@@ -756,11 +795,14 @@ def sniff_probe(page_url, candidates, browser_title=None):
         return {"ok": False, "error": "yt-dlp not found"}
     env = build_env()
 
-    # Manifests first, then progressive files; cap the work so probing stays snappy.
+    # Manifests first, then progressive files; cap the work so probing stays
+    # snappy. The extension already orders these freshest-first, so a valid CDN
+    # link is usually hit immediately; a short per-candidate timeout keeps a batch
+    # of expired links from stalling the whole check.
     ordered = sorted(candidates or [], key=lambda u: 0 if _is_manifest_url(u) else 1)
     best = None
-    for cand in ordered[:6]:
-        r = _probe_ytdlp(ytdlp, env, cand, referer=page_url, timeout=45)
+    for cand in ordered[:5]:
+        r = _probe_ytdlp(ytdlp, env, cand, referer=page_url, timeout=20)
         log(f"sniff_probe candidate ok={r.get('ok')} h={r.get('height')} {cand[:120]}")
         if r.get("ok"):
             r["url"] = cand
@@ -877,13 +919,13 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
     out_tmpl = "%(title)s.%(ext)s"
     if special:
         # Name the file after the best available title (see special_title).
-        name = special_title(special, browser_title)
+        name = _strip_hashtags(special_title(special, browser_title))
         if name:
             out_tmpl = _safe_filename(name) + ".%(ext)s"
     elif req_referer and browser_title:
         # Sniffed download of a raw media/manifest URL: yt-dlp's title would be a
         # meaningless CDN filename, so name the file after the page title.
-        out_tmpl = _safe_filename(browser_title) + ".%(ext)s"
+        out_tmpl = _safe_filename(_strip_hashtags(browser_title)) + ".%(ext)s"
 
     # Files/stems yt-dlp tells us it's creating, so a cancel can delete exactly
     # those (and their .part/.ytdl/thumbnail sidecars).
