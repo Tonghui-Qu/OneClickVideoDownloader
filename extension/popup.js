@@ -7,11 +7,12 @@ const foldersEl = document.getElementById("folders");
 const previewEl = document.getElementById("preview");
 const thumbEl = document.getElementById("thumb");
 const titleEl = document.getElementById("title");
+const metaEl = document.getElementById("meta");
 const downloadsSection = document.getElementById("downloadsSection");
 const downloadsEl = document.getElementById("downloads");
 const clearFinishedButton = document.getElementById("clearFinished");
 
-function showPreview(title, thumb) {
+function showPreview(title, thumb, meta) {
     previewEl.classList.remove("hidden", "checking");
     // Inline style is used instead of a class because the #thumb ID selector
     // outranks a .hidden class rule, so toggling a class wouldn't hide it.
@@ -23,6 +24,8 @@ function showPreview(title, thumb) {
         thumbEl.style.display = "none";
     }
     titleEl.textContent = title || "";
+    metaEl.textContent = meta || "";
+    metaEl.style.display = meta ? "block" : "none";
 }
 
 function showChecking() {
@@ -38,6 +41,7 @@ function hidePreview() {
     previewEl.innerHTML = "";
     previewEl.appendChild(thumbEl);
     previewEl.appendChild(titleEl);
+    previewEl.appendChild(metaEl);
 }
 
 async function probeCurrentTab() {
@@ -61,7 +65,7 @@ async function probeCurrentTab() {
         const result = await chrome.runtime.sendNativeMessage(HOST, { action: "probe", url, title: tab.title || "" });
         hidePreview();
         if (result && result.ok) {
-            showPreview(result.title, result.thumb);
+            showPreview(result.title, result.thumb, result.meta);
             setStatus("Ready to download");
             downloadButton.disabled = false;
         } else {

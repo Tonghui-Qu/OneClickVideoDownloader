@@ -443,10 +443,34 @@ def _safe_filename(name):
     return (name or "video")[:150]
 
 
+def _fmt_meta(resolution, fps):
+    """Formats the '1920×1080 · 60fps' line shown under the title. Missing or
+    unknown ('NA') parts are simply dropped."""
+    parts = []
+    if resolution and "x" in resolution.lower():
+        w, _, h = resolution.lower().partition("x")
+        try:
+            parts.append(f"{int(w)}×{int(h)}")
+        except ValueError:
+            pass
+    try:
+        f = float(fps)
+        if f > 0:
+            parts.append(f"{int(round(f))}fps")
+    except (TypeError, ValueError):
+        pass
+    return " · ".join(parts)
+
+
+# Marker prefix for the resolution/fps print line, so we can pick it out of
+# yt-dlp's stdout regardless of what the title contains.
+META_MARKER = "OCVDMETA|"
+
+
 def probe(url, browser_title=None):
     """Checks whether a URL has a downloadable video, without downloading it.
-    Returns the title and a thumbnail (as a base64 data URI, so the popup can
-    show it regardless of CORS / login requirements)."""
+    Returns the title, a thumbnail (as a base64 data URI, so the popup can show
+    it regardless of CORS / login requirements), and a resolution/fps line."""
     ytdlp = find_ytdlp()
     if not ytdlp:
         return {"ok": False, "error": "yt-dlp not found"}
@@ -461,7 +485,7 @@ def probe(url, browser_title=None):
         thumb = None
         if special.get("thumb_url"):
             thumb = _fetch_thumb_data_uri(special["thumb_url"], referer=url)
-        return {"ok": True, "title": title, "thumb": thumb}
+        return {"ok": True, "title": title, "thumb": thumb, "meta": ""}
 
     env = build_env()
 
@@ -486,6 +510,7 @@ def probe(url, browser_title=None):
                 "-P", tmp,
                 "-o", "%(id)s.%(ext)s",
                 "--print", "%(title)s",
+                "--print", META_MARKER + "%(resolution)s|%(fps)s",
                 url,
             ]
             try:
@@ -495,20 +520,30 @@ def probe(url, browser_title=None):
                 return {"ok": False, "error": "Timed out while checking"}
 
             title = ""
+            meta = ""
             if result.stdout:
                 lines = result.stdout.decode("utf-8", "replace").strip().splitlines()
-                if lines:
-                    title = lines[0]
+                non_meta = []
+                for ln in lines:
+                    if ln.startswith(META_MARKER):
+                        bits = ln[len(META_MARKER):].split("|")
+                        res = bits[0] if len(bits) > 0 else ""
+                        fps = bits[1] if len(bits) > 1 else ""
+                        meta = _fmt_meta(res, fps)
+                    else:
+                        non_meta.append(ln)
+                if non_meta:
+                    title = non_meta[0]
 
             jpgs = sorted(Path(tmp).glob("*.jpg"))
             if result.returncode == 0 and jpgs:
                 data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
-                return {"ok": True, "title": title,
+                return {"ok": True, "title": title, "meta": meta,
                         "thumb": "data:image/jpeg;base64," + data}
 
             # Extraction succeeded but no thumbnail, or extraction failed.
             if result.returncode == 0:
-                return {"ok": True, "title": title, "thumb": None}
+                return {"ok": True, "title": title, "meta": meta, "thumb": None}
             err = result.stderr.decode("utf-8", "replace")
             return {"ok": False, "error": err or "No video found"}
         finally:
