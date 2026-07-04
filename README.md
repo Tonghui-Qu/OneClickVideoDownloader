@@ -1,6 +1,6 @@
 # OneClick Video Downloader
 
-A Chrome extension that downloads the video on the current tab (YouTube, Instagram, TikTok, and [anything `yt-dlp` supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)) with a single click. Videos are saved to your `~/Downloads` folder in the highest available quality.
+A Chrome extension that downloads the video on the current tab (YouTube, Instagram, TikTok, Douyin, and [anything `yt-dlp` supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)) with a single click. Videos are saved to your `~/Downloads` folder in the highest available quality.
 
 It works by pairing a small Chrome extension with a local **native messaging host** (a Python script that runs `yt-dlp`). Chrome launches the helper automatically on demand — there is **no server to start manually**.
 
@@ -140,6 +140,9 @@ Common issues:
 
 - **Instagram fails with "Instagram API is not granting access" / HTTP 400**
   Instagram frequently blocks `yt-dlp`. Make sure you're **logged into Instagram in Chrome** (the host reads your Chrome cookies via `--cookies-from-browser chrome`) and run `brew upgrade yt-dlp`. Some private/restricted posts may never be downloadable.
+
+- **Douyin (抖音) shows "No video found"**
+  yt-dlp's own Douyin extractor is broken (it needs a JS-signed request that browser cookies can't provide), so the host resolves Douyin videos itself via the public share page. Make sure you've **redeployed the host** after updating (`./install.sh <YOUR_EXTENSION_ID>`). It works on the feed/modal URLs (`douyin.com/jingxuan?modal_id=…`), `douyin.com/video/<id>`, and `v.douyin.com/…` short links.
 
 - **YouTube only downloads low quality or errors on formats**
   Ensure `deno` is installed (`brew install deno`) — it's required to unlock YouTube's high-resolution streams.

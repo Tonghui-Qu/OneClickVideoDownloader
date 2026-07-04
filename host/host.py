@@ -109,6 +109,30 @@ def send_message(obj):
         log("SEND FAILED:\n" + traceback.format_exc())
 
 
+def normalize_url(url):
+    """Rewrites known SPA/feed URLs into the canonical form yt-dlp understands.
+
+    Douyin's web player shows a video inside a modal on top of a feed page
+    (e.g. /jingxuan, /discover, /user/..., /follow), keeping the feed URL and
+    stashing the real video id in a ?modal_id=... query param. yt-dlp's Douyin
+    extractor only matches /video/<id>, so the raw feed URL is "Unsupported".
+    We pull the id out and hand yt-dlp the /video/<id> URL it expects."""
+    try:
+        parts = urllib.parse.urlparse(url)
+    except Exception:
+        return url
+    host = parts.netloc.lower()
+    if host.endswith("douyin.com"):
+        # Already a canonical video/note URL -> leave it alone.
+        if re.match(r"^/(?:video|note)/\d+", parts.path):
+            return url
+        qs = urllib.parse.parse_qs(parts.query)
+        modal = (qs.get("modal_id") or [None])[0]
+        if modal and modal.isdigit():
+            return f"https://www.douyin.com/video/{modal}"
+    return url
+
+
 def resolve_dir(requested):
     """Pick the download directory. Falls back to ~/Downloads when the
     requested folder is missing (e.g. deleted, renamed, or on an unmounted
@@ -211,7 +235,8 @@ def resolve_91porn(url):
         if pm:
             thumb_url = html_mod.unescape(pm.group(1))
 
-    return {"url": srcs[0], "title": title, "referer": url, "thumb_url": thumb_url}
+    return {"url": srcs[0], "title": title, "referer": url,
+            "thumb_url": thumb_url, "prefer_browser_title": True}
 
 
 def _clean_91_title(raw):
@@ -240,11 +265,122 @@ def _fetch_thumb_data_uri(thumb_url, referer=None):
         return None
 
 
+MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+             "Version/15.0 Mobile/15E148 Safari/604.1")
+
+
+def is_douyin(url):
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host.endswith("douyin.com")
+
+
+def _douyin_aweme_id(url):
+    """Extracts the numeric aweme (video) id from a Douyin URL, following the
+    v.douyin.com short-link redirect when necessary."""
+    parts = urllib.parse.urlparse(url)
+    m = re.search(r"/(?:video|note)/(\d+)", parts.path)
+    if m:
+        return m.group(1)
+    modal = urllib.parse.parse_qs(parts.query).get("modal_id", [None])[0]
+    if modal and modal.isdigit():
+        return modal
+    # Short links (v.douyin.com/XXXX) redirect to the canonical page.
+    if parts.netloc.lower().startswith("v.douyin.com"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": MOBILE_UA})
+            final = urllib.request.urlopen(req, timeout=30).geturl()
+            m = re.search(r"/(?:video|note)/(\d+)", final)
+            if m:
+                return m.group(1)
+            m = re.search(r"[?&]modal_id=(\d+)", final)
+            if m:
+                return m.group(1)
+        except Exception as e:
+            log(f"douyin short-link resolve failed: {e}")
+    return None
+
+
+def resolve_douyin(url):
+    """Returns {"url": direct_mp4, "title": str, "referer": ...} or None.
+
+    yt-dlp's Douyin extractor is broken (it needs a JS-signed `a_bogus` param
+    that browser cookies alone can't satisfy). Instead we hit the public share
+    page, which embeds the full video metadata in a `window._ROUTER_DATA` JSON
+    blob — no signature required — and pull the direct play_addr URL from it."""
+    aweme_id = _douyin_aweme_id(url)
+    if not aweme_id:
+        return None
+
+    share_url = f"https://www.iesdouyin.com/share/video/{aweme_id}/"
+    try:
+        req = urllib.request.Request(
+            share_url, headers={"User-Agent": MOBILE_UA,
+                                "Referer": "https://www.douyin.com/"})
+        page = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+    except Exception as e:
+        log(f"resolve_douyin fetch failed: {e}")
+        return None
+
+    m = re.search(r'window\._ROUTER_DATA\s*=\s*(\{.*?\})</script>', page, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+        info = data["loaderData"]["video_(id)/page"].get("videoInfoRes", {})
+        items = info.get("item_list") or []
+        if not items:
+            log(f"resolve_douyin: empty item_list (filter={info.get('filter_list')})")
+            return None
+        item = items[0]
+        video = item.get("video", {})
+        urls = (video.get("play_addr", {}) or {}).get("url_list") or []
+        if not urls:
+            return None
+        # Swap the watermarked endpoint for the clean one (smaller, no logo).
+        media_url = urls[0].replace("/playwm/", "/play/")
+
+        thumb_url = None
+        cover = (video.get("cover") or video.get("origin_cover") or {}).get("url_list") or []
+        # Prefer a plain jpeg cover (some entries lead with .webp).
+        for c in cover:
+            if ".jpeg" in c or ".jpg" in c:
+                thumb_url = c
+                break
+        if not thumb_url and cover:
+            thumb_url = cover[0]
+
+        return {
+            "url": media_url,
+            "title": (item.get("desc") or "").strip(),
+            "referer": "https://www.douyin.com/",
+            "thumb_url": thumb_url,
+        }
+    except Exception as e:
+        log(f"resolve_douyin parse failed: {e}")
+        return None
+
+
 def resolve_special(url):
     """Dispatches to a site-specific resolver. Returns a dict or None."""
     if is_91porn(url):
         return resolve_91porn(url)
+    if is_douyin(url):
+        return resolve_douyin(url)
     return None
+
+
+def special_title(special, browser_title):
+    """Picks the best title for a self-resolved site. Some sites (91porn) show a
+    localized title in the tab that beats our cookieless fetch; others (Douyin)
+    put the uploader — not the video caption — in the tab, so the resolver's own
+    title wins there."""
+    if special.get("prefer_browser_title") and browser_title:
+        return _clean_91_title(browser_title)
+    return special.get("title") or (browser_title or "")
 
 
 def _unescape_all(text):
@@ -272,13 +408,13 @@ def probe(url, browser_title=None):
     if not ytdlp:
         return {"ok": False, "error": "yt-dlp not found"}
 
+    url = normalize_url(url)
+
     # Sites we resolve ourselves: if we can find the real media URL, the video
     # is downloadable even though yt-dlp's own extractors can't see it.
     special = resolve_special(url)
     if special:
-        # Prefer the browser's title (already in the language the user selected
-        # on the site) over what our own cookieless fetch returns.
-        title = _clean_91_title(browser_title) if browser_title else special.get("title", "")
+        title = special_title(special, browser_title)
         thumb = None
         if special.get("thumb_url"):
             thumb = _fetch_thumb_data_uri(special["thumb_url"], referer=url)
@@ -363,6 +499,8 @@ def download(url, requested_dir=None, browser_title=None):
                       "error": "yt-dlp not found. Run: brew install yt-dlp"})
         return
 
+    url = normalize_url(url)
+
     target_dir, fell_back = resolve_dir(requested_dir)
     env = build_env()
 
@@ -373,9 +511,8 @@ def download(url, requested_dir=None, browser_title=None):
     referer = special.get("referer") if special else None
     out_tmpl = "%(title)s.%(ext)s"
     if special:
-        # Name the file after the browser's (localized) title when available,
-        # otherwise the title from our own fetch.
-        name = _clean_91_title(browser_title) if browser_title else special.get("title")
+        # Name the file after the best available title (see special_title).
+        name = special_title(special, browser_title)
         if name:
             out_tmpl = _safe_filename(name) + ".%(ext)s"
 
