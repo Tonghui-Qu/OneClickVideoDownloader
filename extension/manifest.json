@@ -9,6 +9,10 @@
     "default_popup": "popup.html"
   },
 
+  "background": {
+    "service_worker": "background.js"
+  },
+
   "permissions": [
     "activeTab",
     "tabs",

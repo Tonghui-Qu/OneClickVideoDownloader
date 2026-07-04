@@ -89,11 +89,6 @@ function hideProgress() {
     progressBar.style.width = "0%";
 }
 
-function parsePercent(str) {
-    const m = /([\d.]+)\s*%/.exec(str || "");
-    return m ? parseFloat(m[1]) : NaN;
-}
-
 // path "" is the special default entry → host saves to ~/Downloads.
 const DEFAULT_FOLDERS = [{ label: "Downloads (default)", path: "" }];
 
@@ -212,6 +207,32 @@ addFolderButton.addEventListener("click", async () => {
     }
 });
 
+// Reflects a download's state (owned by the background worker) onto the UI.
+// Called both for live broadcasts and to restore the view when the popup opens.
+function applyDownloadState(dl) {
+    if (!dl) return;
+    if (dl.active) {
+        downloadButton.disabled = true;
+        showProgress(typeof dl.percent === "number" && !isNaN(dl.percent) ? dl.percent : NaN);
+        setStatus(dl.statusText || "Downloading…");
+    } else if (dl.done) {
+        hideProgress();
+        downloadButton.disabled = false;
+        if (dl.success) {
+            setStatus(dl.fellBack
+                ? "✅ Finished — folder missing, saved to ~/Downloads"
+                : "✅ Finished");
+        } else {
+            setStatus("❌ " + (dl.error || "Download Failed"));
+        }
+    }
+}
+
+// Live updates from the background worker while the popup is open.
+chrome.runtime.onMessage.addListener((msg) => {
+    if (msg && msg.type === "state") applyDownloadState(msg.state);
+});
+
 downloadButton.addEventListener("click", async () => {
     try {
         setStatus("Getting current page…");
@@ -226,48 +247,15 @@ downloadButton.addEventListener("click", async () => {
 
         const dir = (folders[selected] && folders[selected].path) || "";
 
-        // A persistent connection lets the host stream progress updates.
+        // Hand the download to the background worker so it survives this popup
+        // being closed. Progress arrives via the "state" broadcast above.
         setStatus("Starting…");
         showProgress(NaN);
         downloadButton.disabled = true;
 
-        let done = false;
-        const port = chrome.runtime.connectNative(HOST);
-
-        port.onMessage.addListener((msg) => {
-            if (!msg) return;
-            if (msg.type === "progress") {
-                showProgress(parsePercent(msg.percent));
-                const bits = [msg.percent, msg.speed, msg.eta ? "ETA " + msg.eta : ""]
-                    .filter((s) => s && s !== "NA" && s !== "N/A");
-                setStatus("Downloading " + bits.join(" · "));
-            } else if (msg.type === "status") {
-                showProgress(NaN);
-                setStatus(msg.stage || "Processing…");
-            } else if (msg.type === "done") {
-                done = true;
-                hideProgress();
-                downloadButton.disabled = false;
-                if (msg.success) {
-                    setStatus(msg.fellBack
-                        ? "✅ Finished — folder missing, saved to ~/Downloads"
-                        : "✅ Finished");
-                } else {
-                    setStatus("❌ " + (msg.error || "Download Failed"));
-                }
-                port.disconnect();
-            }
+        await chrome.runtime.sendMessage({
+            cmd: "start", url, dir, title: tab.title || "",
         });
-
-        port.onDisconnect.addListener(() => {
-            if (done) return;
-            hideProgress();
-            downloadButton.disabled = false;
-            const err = chrome.runtime.lastError;
-            setStatus("❌ " + (err && err.message ? err.message : "Connection closed"));
-        });
-
-        port.postMessage({ url, dir, title: tab.title || "" });
     } catch (e) {
         console.error(e);
         hideProgress();
@@ -279,5 +267,23 @@ downloadButton.addEventListener("click", async () => {
 (async function init() {
     await loadState();
     render();
+
+    // If a download is already running (popup was reopened mid-download), show
+    // its live progress instead of probing the current tab.
+    let dl = null;
+    try {
+        const resp = await chrome.runtime.sendMessage({ cmd: "getState" });
+        dl = resp && resp.state;
+    } catch (e) { /* worker not ready; fall through to probe */ }
+
+    if (dl && dl.active) {
+        applyDownloadState(dl);
+        return;
+    }
+    if (dl && dl.done) {
+        // Show the last result, then clear it so it isn't shown again later.
+        applyDownloadState(dl);
+        chrome.runtime.sendMessage({ cmd: "clearFinished" }).catch(() => {});
+    }
     probeCurrentTab();
 })();

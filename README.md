@@ -83,6 +83,8 @@ What this does:
 
 That's it — you never have to start a server or run anything manually again.
 
+> **Closing the popup won't cancel a download.** The download runs in the extension's background service worker, so you can close the popup (or click away) and it keeps going. Reopen the popup any time to see live progress or the final result.
+
 ### Choosing where videos are saved
 
 By default videos go to `~/Downloads`. You can save them to other folders:
@@ -156,7 +158,8 @@ OneClickVideoDownloader/
 ├── extension/              # The Chrome extension (load this folder)
 │   ├── manifest.json       # MV3 manifest (nativeMessaging permission)
 │   ├── popup.html          # Toolbar popup UI
-│   └── popup.js            # Sends current tab URL to the native host
+│   ├── popup.js            # Probes the tab, tells the worker to download
+│   └── background.js       # Service worker; owns the download (survives popup close)
 └── host/                   # The local download helper
     ├── run_host.sh         # Bash launcher Chrome execs (picks a real python3)
     ├── host.py             # Native messaging host; runs yt-dlp
