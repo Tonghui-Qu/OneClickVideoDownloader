@@ -44,6 +44,11 @@ function hidePreview() {
     previewEl.appendChild(metaEl);
 }
 
+// Set when the user clicks Download so the next state render scrolls the newly
+// added row into view (the popup is often taller than Chrome's ~600px cap, so
+// the downloads list would otherwise sit below the fold, needing a manual scroll).
+let scrollToNewDownload = false;
+
 // What a download click should actually fetch. For sites yt-dlp knows, this is
 // the page URL (best quality via the site's extractor). When that finds nothing,
 // it becomes a sniffed media URL plus the page as its referer.
@@ -382,6 +387,18 @@ function renderDownloads(list) {
             dlRows.delete(id);
         }
     }
+
+    // Just clicked Download: bring the freshly added (bottom-most) row into view
+    // so the user sees its progress without scrolling. Wait a frame so the
+    // just-unhidden section has its final layout before scrolling.
+    if (scrollToNewDownload && list.length) {
+        scrollToNewDownload = false;
+        requestAnimationFrame(() => {
+            downloadsSection.scrollIntoView({ behavior: "smooth", block: "end" });
+            // The list has its own max-height/scroll; pin it to the newest row too.
+            downloadsEl.scrollTop = downloadsEl.scrollHeight;
+        });
+    }
 }
 
 // Live updates from the background worker while the popup is open.
@@ -412,6 +429,8 @@ downloadButton.addEventListener("click", async () => {
         // Hand the download to the background worker so it survives this popup
         // being closed and runs alongside any others. Progress arrives via the
         // "state" broadcast above.
+        // Scroll the new row into view when the resulting state broadcast lands.
+        scrollToNewDownload = true;
         await chrome.runtime.sendMessage({
             cmd: "start", url: src.url, referer: src.referer || "",
             dir, title: tab.title || "",
