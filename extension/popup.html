@@ -9,25 +9,25 @@
             width: 300px;
             box-sizing: border-box;
             margin: 0;
-            padding: 14px 16px;
+            padding: 10px 14px;
             font-family: -apple-system, BlinkMacSystemFont, sans-serif;
             background: white;
             color: #1c1c1e;
         }
 
-        /* Single-column natural flow: nothing scrolls on its own, so the whole
-           popup fits in one view (folders are always shown in full). */
-        #bottomBar { padding-top: 8px; }
+        /* Single-column natural flow, spacing kept tight so the whole popup fits
+           within Chrome's ~600px popup height without scrolling. */
+        #bottomBar { padding-top: 6px; }
 
         h2 {
-            margin: 0 0 12px;
+            margin: 0 0 8px;
             text-align: center;
-            font-size: 17px;
+            font-size: 16px;
         }
 
         button {
             width: 100%;
-            height: 44px;
+            height: 40px;
             font-size: 16px;
             border: none;
             border-radius: 8px;
@@ -56,7 +56,7 @@
         .folder {
             display: flex;
             align-items: center;
-            padding: 8px 10px;
+            padding: 6px 10px;
             border-bottom: 1px solid #f0f0f2;
             gap: 8px;
         }
@@ -96,11 +96,11 @@
         }
 
         #addFolder {
-            height: 34px;
+            height: 32px;
             font-size: 13px;
             background: #f2f2f7;
             color: #007AFF;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
         #addFolder:hover { background: #e5e5ea; }
 
@@ -111,7 +111,7 @@
         .hidden { display: none; }
 
         /* Downloads list */
-        #downloadsSection { margin-top: 10px; }
+        #downloadsSection { margin-top: 8px; }
         #downloadsHeader {
             display: flex;
             align-items: baseline;
@@ -131,7 +131,7 @@
         #downloads {
             border: 1px solid #e5e5ea;
             border-radius: 8px;
-            max-height: 220px;
+            max-height: 180px;
             overflow-y: auto;
         }
 
@@ -139,7 +139,7 @@
             display: flex;
             align-items: center;
             gap: 8px;
-            padding: 8px 10px;
+            padding: 6px 10px;
             border-bottom: 1px solid #f0f0f2;
         }
         .dl:last-child { border-bottom: none; }
@@ -209,7 +209,7 @@
         .dl-x:hover { background: #ffe5e5; color: #ff3b30; }
 
         #preview {
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
         #thumb {
             display: block;
@@ -217,16 +217,15 @@
             max-width: 100%;
             height: auto;
             /* Show the whole frame at the video's own aspect ratio (no crop).
-               Cap tall (portrait) videos at ~2/3 of their full-width height so
-               they don't dominate the popup — the image scales down and stays
-               centered (no side bars). Landscape frames stay shorter and are
-               unaffected. */
-            max-height: 318px;
+               Cap tall (portrait) videos so they don't dominate the popup — the
+               image scales down and stays centered (no side bars). Landscape
+               frames stay shorter and are unaffected. */
+            max-height: 260px;
             border-radius: 8px;
             background: #f2f2f7;
         }
         #title {
-            margin-top: 6px;
+            margin-top: 5px;
             font-size: 13px;
             line-height: 1.3;
             color: #1c1c1e;
@@ -248,11 +247,11 @@
         }
 
         #status {
-            margin-top: 8px;
+            margin-top: 6px;
             color: #666;
             text-align: center;
             font-size: 13px;
-            min-height: 16px;
+            min-height: 14px;
             word-break: break-word;
         }
     </style>
