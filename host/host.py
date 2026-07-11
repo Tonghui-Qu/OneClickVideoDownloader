@@ -868,6 +868,11 @@ MERGE_RE = re.compile(r'Merging formats into\s+"(.+?)"\s*$')
 TEMP_SUFFIXES = (".part", ".ytdl", ".temp")
 THUMB_SUFFIXES = (".webp", ".jpg", ".jpeg", ".png")
 
+# Extensions a *finished* download can land as. A stem is only considered
+# "taken" (and thus bumped to " (1)", " (2)", …) when a completed file with one
+# of these exists — a bare .part is a resume target, not a collision.
+FINAL_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".mov")
+
 
 def _try_unlink(path, removed):
     try:
@@ -908,8 +913,66 @@ def cleanup_partials(paths=None, stems=None):
             for f in globmod.glob(base + "*" + suf):
                 _try_unlink(f, removed)
         for f in globmod.glob(base + "*.part-Frag*"):
-            _try_unlink(f, removed)
+                _try_unlink(f, removed)
     return removed
+
+
+def _unique_stem(directory, stem):
+    """Chrome-style de-dup for the output filename.
+
+    Returns `stem` unchanged unless a *finished* file with that name already
+    exists, in which case it returns "stem (1)", "stem (2)", … — so a new
+    download never overwrites (or re-tags the thumbnail of) an existing video.
+
+    An in-progress `.part` for a candidate makes that candidate reusable rather
+    than skipped, so pausing and resuming continues the same partial file
+    instead of starting a fresh numbered copy."""
+    import glob as globmod
+    d = Path(directory)
+
+    def has_final(s):
+        return any((d / f"{s}{ext}").exists() for ext in FINAL_EXTS)
+
+    def has_partial(s):
+        # yt-dlp names partials "<stem>.<fmt>.<ext>.part" / "<stem>.part", so the
+        # char after the stem is always ".". Anchoring on that dot avoids matching
+        # a numbered sibling's partial (e.g. "<stem> (2).mp4.part") as this stem's.
+        base = globmod.escape(str(d / s))
+        return bool(globmod.glob(base + ".part") or
+                    globmod.glob(base + ".*.part") or
+                    globmod.glob(base + ".*.part-Frag*"))
+
+    def usable(s):
+        return has_partial(s) or not has_final(s)
+
+    if usable(stem):
+        return stem
+    i = 1
+    while not usable(f"{stem} ({i})"):
+        i += 1
+    return f"{stem} ({i})"
+
+
+def _resolve_stem(ytdlp, env, dl_url, referer=None, timeout=60):
+    """Asks yt-dlp what it would name the file, so our collision check uses the
+    exact same sanitization yt-dlp applies to %(title)s. Returns a bare stem
+    (no directory, no extension) or None if it can't be determined."""
+    cmd = [ytdlp, "--no-playlist", "--no-warnings"]
+    if referer:
+        cmd += ["--add-header", f"Referer: {referer}"]
+    cmd += ["--print", "filename", "-o", "%(title)s.%(ext)s",
+            "--merge-output-format", "mp4",
+            "--cookies-from-browser", "chrome", dl_url]
+    try:
+        res = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        log(f"_resolve_stem failed: {e}")
+        return None
+    lines = (res.stdout or "").strip().splitlines()
+    if not lines or not lines[0].strip():
+        return None
+    return Path(lines[0].strip()).with_suffix("").name or None
 
 
 def download(url, requested_dir=None, browser_title=None, req_referer=None,
@@ -938,16 +1001,29 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
     # Referer: our own resolver knows the right one; otherwise use the page URL
     # the popup passed for a sniffed media/manifest download (CDNs often require it).
     referer = special.get("referer") if special else req_referer
-    out_tmpl = "%(title)s.%(ext)s"
+    # Decide the output filename stem. For sites we resolve ourselves or sniffed
+    # media downloads we already know the title; for everything else we ask
+    # yt-dlp what it would name the file so our collision check matches exactly.
+    stem = None
     if special:
         # Name the file after the best available title (see special_title).
         name = _strip_hashtags(special_title(special, browser_title))
         if name:
-            out_tmpl = _safe_filename(name) + ".%(ext)s"
+            stem = _safe_filename(name)
     elif req_referer and browser_title:
         # Sniffed download of a raw media/manifest URL: yt-dlp's title would be a
         # meaningless CDN filename, so name the file after the page title.
-        out_tmpl = _safe_filename(_strip_hashtags(browser_title)) + ".%(ext)s"
+        stem = _safe_filename(_strip_hashtags(browser_title))
+    else:
+        stem = _resolve_stem(ytdlp, env, dl_url, referer)
+
+    # Never clobber an existing video: if the target name is taken, download the
+    # new one as "Title (1).mp4", "Title (2).mp4", … (Chrome-style). If we can't
+    # determine a stem up front, fall back to yt-dlp's own %(title)s template.
+    if stem:
+        out_tmpl = _unique_stem(target_dir, stem) + ".%(ext)s"
+    else:
+        out_tmpl = "%(title)s.%(ext)s"
 
     # Files/stems yt-dlp tells us it's creating, so a cancel can delete exactly
     # those (and their .part/.ytdl/thumbnail sidecars).
