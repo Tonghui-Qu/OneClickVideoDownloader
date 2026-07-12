@@ -48,6 +48,17 @@ function recordMedia(tabId, url, kind) {
     m.set(url, { url, kind, ts: Date.now() });
 }
 
+// Request types we bother inspecting. Video streams surface as `media` (native
+// <video>), `xmlhttprequest` (JS players: hls.js/dash.js/Shaka fetch manifests
+// and segments), or occasionally `other` (fetch from a page Worker, etc.); the
+// last is the safety net so unusual players aren't missed. `main_frame` is kept
+// only to clear a tab's captures on navigation. Everything else (image, script,
+// stylesheet, font, ping, beacon, …) is never media, so skipping it avoids
+// waking/running the worker for the bulk of a page's requests.
+const SNIFF_TYPES = ["main_frame", "media", "xmlhttprequest", "other"];
+// onHeadersReceived doesn't need main_frame (it only classifies by Content-Type).
+const CT_TYPES = ["media", "xmlhttprequest", "other"];
+
 chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
         // A new top-level navigation means a new page: forget the old captures.
@@ -55,7 +66,7 @@ chrome.webRequest.onBeforeRequest.addListener(
         const kind = classifyByUrl(details.url);
         if (kind) recordMedia(details.tabId, details.url, kind);
     },
-    { urls: ["<all_urls>"] }
+    { urls: ["<all_urls>"], types: SNIFF_TYPES }
 );
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -68,7 +79,7 @@ chrome.webRequest.onHeadersReceived.addListener(
                 /mpegurl|dash/i.test(ct) ? "manifest" : "file");
         }
     },
-    { urls: ["<all_urls>"] },
+    { urls: ["<all_urls>"], types: CT_TYPES },
     ["responseHeaders"]
 );
 
