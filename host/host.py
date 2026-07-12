@@ -662,17 +662,38 @@ IMG_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
             ".png": "image/png", ".gif": "image/gif"}
 
 
+def _sniff_image_mime(data):
+    """Identifies an image by its magic bytes (yt-dlp sometimes writes a
+    thumbnail with a useless '.image' extension, e.g. TikTok). Returns a MIME
+    type or None."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _thumb_from_dir(tmp):
-    """Returns the thumbnail yt-dlp wrote into `tmp` as a base64 data URI (using
-    its native format), or None if none was written."""
-    imgs = [p for p in sorted(Path(tmp).iterdir())
-            if p.is_file() and p.suffix.lower() in IMG_MIME]
-    if not imgs:
-        return None
-    p = imgs[0]
-    mime = IMG_MIME.get(p.suffix.lower(), "image/jpeg")
-    data = base64.b64encode(p.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{data}"
+    """Returns the thumbnail yt-dlp wrote into `tmp` as a base64 data URI, or
+    None if none was written. The MIME type comes from the file extension when
+    known, otherwise from sniffing the file's magic bytes — so a thumbnail saved
+    with an opaque extension (e.g. TikTok's '.image') is still recognized."""
+    for p in sorted(Path(tmp).iterdir()):
+        if not p.is_file():
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        mime = IMG_MIME.get(p.suffix.lower()) or _sniff_image_mime(data[:16])
+        if not mime:
+            continue
+        return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+    return None
 
 
 def _enrich_meta(media_url, res, fps, fsize, fapprox, tbr, dur,
@@ -745,9 +766,9 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             "-P", tmp,
             "-o", "%(id)s.%(ext)s",
             "--print", "%(title)s",
-            "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|"
+            "--print", META_MARKER + "%(resolution)s|%(fps,requested_formats.0.fps)s|%(filesize)s|"
             "%(filesize_approx)s|%(tbr)s|%(duration)s",
-            "--print", URL_MARKER + "%(url)s",
+            "--print", URL_MARKER + "%(url,requested_formats.0.url)s",
             url,
         ]
         try:
@@ -833,9 +854,9 @@ def _probe_ytdlp_stream(ytdlp, env, url, referer=None, force_generic=False,
             "-P", tmp,
             "-o", "%(id)s.%(ext)s",
             "--print", "%(title)s",
-            "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|"
+            "--print", META_MARKER + "%(resolution)s|%(fps,requested_formats.0.fps)s|%(filesize)s|"
             "%(filesize_approx)s|%(tbr)s|%(duration)s",
-            "--print", URL_MARKER + "%(url)s",
+            "--print", URL_MARKER + "%(url,requested_formats.0.url)s",
             url,
         ]
 
