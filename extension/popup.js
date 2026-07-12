@@ -12,6 +12,17 @@ const downloadsSection = document.getElementById("downloadsSection");
 const downloadsEl = document.getElementById("downloads");
 const clearFinishedButton = document.getElementById("clearFinished");
 
+// The download button doubles as the detection indicator: it shows the normal
+// "Download Current Video" label when a video is ready and "No video found"
+// (disabled) otherwise, so no separate status line is needed for those states.
+const DEFAULT_BTN_LABEL = downloadButton.textContent;
+const NO_VIDEO_BTN_LABEL = "No video found";
+
+function setButtonState(label, enabled) {
+    downloadButton.textContent = label;
+    downloadButton.disabled = !enabled;
+}
+
 function showPreview(title, thumb, meta) {
     previewEl.classList.remove("hidden", "checking");
     // Inline style is used instead of a class because the #thumb ID selector
@@ -122,7 +133,8 @@ async function probeCurrentTab() {
 
     if (!/^https?:\/\//i.test(url)) {
         hidePreview();
-        setStatus("No video found");
+        setButtonState(NO_VIDEO_BTN_LABEL, false);
+        setStatus("");
         return;
     }
 
@@ -154,8 +166,8 @@ async function probeCurrentTab() {
         // Prefer the probe's title, fall back to the tab title already shown.
         showPreview(meta.title || tabTitle, null, meta.meta);
         currentSource = { url, referer: "", title: meta.title || tabTitle, thumb: null };
-        setStatus("Ready to download");
-        downloadButton.disabled = false;
+        setButtonState(DEFAULT_BTN_LABEL, true);
+        setStatus("");
         return;
     }
 
@@ -168,10 +180,11 @@ async function probeCurrentTab() {
             url: sniffed.url, referer: url,
             title: sniffed.title || tabTitle, thumb: sniffed.thumb || null,
         };
-        setStatus("Ready to download");
-        downloadButton.disabled = false;
+        setButtonState(DEFAULT_BTN_LABEL, true);
+        setStatus("");
     } else {
-        setStatus("No video found");
+        setButtonState(NO_VIDEO_BTN_LABEL, false);
+        setStatus("");
     }
 }
 
