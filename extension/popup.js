@@ -28,12 +28,6 @@ function showPreview(title, thumb, meta) {
     metaEl.style.display = meta ? "block" : "none";
 }
 
-function showChecking() {
-    previewEl.classList.remove("hidden");
-    previewEl.classList.add("checking");
-    previewEl.textContent = "Checking this page…";
-}
-
 function hidePreview() {
     previewEl.classList.add("hidden");
     previewEl.classList.remove("checking");
@@ -81,6 +75,43 @@ async function trySniffedCandidates(tab, pageUrl) {
     return null;
 }
 
+// Runs the host probe over a native-messaging *port* so it can deliver two
+// messages: `probeMeta` (title + resolution — resolves this promise so the
+// button can enable) and, a beat later, `probeThumb` (the preview image, handed
+// to onThumb). Resolves with the meta message (or null), rejects on port error.
+function runProbePort(url, title, onThumb) {
+    return new Promise((resolve, reject) => {
+        let port;
+        try {
+            port = chrome.runtime.connectNative(HOST);
+        } catch (e) {
+            reject(e);
+            return;
+        }
+        let meta = null;
+        let settled = false;
+        port.onMessage.addListener((msg) => {
+            if (!msg) return;
+            if (msg.type === "probeMeta") {
+                meta = msg;
+                if (!settled) { settled = true; resolve(msg); }
+            } else if (msg.type === "probeThumb") {
+                if (onThumb) onThumb(msg.thumb);
+                try { port.disconnect(); } catch (e) { /* already gone */ }
+            }
+        });
+        port.onDisconnect.addListener(() => {
+            const err = chrome.runtime.lastError;
+            if (!settled) {
+                settled = true;
+                if (err) reject(new Error(err.message));
+                else resolve(meta);
+            }
+        });
+        port.postMessage({ action: "probe", url, title });
+    });
+}
+
 async function probeCurrentTab() {
     // No downloadable video until we confirm one exists.
     downloadButton.disabled = true;
@@ -95,35 +126,47 @@ async function probeCurrentTab() {
         return;
     }
 
-    showChecking();
-    setStatus("");
-    try {
-        // tab.title is already in the language the user selected on the site,
-        // so the host can use it for the (localized) preview and filename.
-        const result = await chrome.runtime.sendNativeMessage(HOST, { action: "probe", url, title: tab.title || "" });
-        if (result && result.ok) {
-            hidePreview();
-            showPreview(result.title, result.thumb, result.meta);
-            currentSource = { url, referer: "" };
-            setStatus("Ready to download");
-            downloadButton.disabled = false;
-            return;
-        }
+    // Optimistic: show the tab's own title immediately so the popup feels
+    // responsive, then refine with the probe result (thumbnail arrives after).
+    // tab.title is already in the language the user selected on the site.
+    const tabTitle = tab.title || "";
+    showPreview(tabTitle, null, "");
+    setStatus("Checking this page…");
 
-        // The page URL isn't a recognizable video — fall back to sniffed media.
-        const sniffed = await trySniffedCandidates(tab, url);
-        hidePreview();
-        if (sniffed) {
-            showPreview(sniffed.title, sniffed.thumb, sniffed.meta);
-            currentSource = { url: sniffed.url, referer: url };
-            setStatus("Ready to download");
-            downloadButton.disabled = false;
-        } else {
-            setStatus("No video found");
-        }
+    let meta = null;
+    try {
+        meta = await runProbePort(url, tabTitle, (thumb) => {
+            // Thumbnail lands after meta; only show it once a video is confirmed.
+            if (thumb && !downloadButton.disabled) {
+                thumbEl.src = thumb;
+                thumbEl.style.display = "block";
+            }
+        });
     } catch (e) {
         hidePreview();
         setStatus("❌ " + e.message);
+        return;
+    }
+
+    if (meta && meta.ok) {
+        // Prefer the probe's title, fall back to the tab title already shown.
+        showPreview(meta.title || tabTitle, null, meta.meta);
+        currentSource = { url, referer: "" };
+        setStatus("Ready to download");
+        downloadButton.disabled = false;
+        return;
+    }
+
+    // The page URL isn't a recognizable video — fall back to sniffed media.
+    const sniffed = await trySniffedCandidates(tab, url);
+    hidePreview();
+    if (sniffed) {
+        showPreview(sniffed.title, sniffed.thumb, sniffed.meta);
+        currentSource = { url: sniffed.url, referer: url };
+        setStatus("Ready to download");
+        downloadButton.disabled = false;
+    } else {
+        setStatus("No video found");
     }
 }
 

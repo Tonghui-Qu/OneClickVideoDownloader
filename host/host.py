@@ -655,6 +655,68 @@ def _res_height(res):
     return 0
 
 
+# Image extensions yt-dlp may write a thumbnail as. We send the raw file to the
+# popup with its real MIME type (Chrome renders webp/png/gif fine), so there's
+# no need to spend an ffmpeg pass converting every thumbnail to jpg.
+IMG_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+            ".png": "image/png", ".gif": "image/gif"}
+
+
+def _thumb_from_dir(tmp):
+    """Returns the thumbnail yt-dlp wrote into `tmp` as a base64 data URI (using
+    its native format), or None if none was written."""
+    imgs = [p for p in sorted(Path(tmp).iterdir())
+            if p.is_file() and p.suffix.lower() in IMG_MIME]
+    if not imgs:
+        return None
+    p = imgs[0]
+    mime = IMG_MIME.get(p.suffix.lower(), "image/jpeg")
+    data = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{data}"
+
+
+def _enrich_meta(media_url, res, fps, fsize, fapprox, tbr, dur,
+                 referer, frame_referer):
+    """Fills in resolution/fps/size some extractors omit (e.g. Twitch, xvideos)
+    by probing the media itself. Only runs on the page-probe path (frame_referer
+    set). Returns the possibly-updated (res, fps, fsize, fapprox)."""
+    if not frame_referer:
+        return res, fps, fsize, fapprox
+    have_url = media_url and media_url not in ("NA", "None")
+    ref = referer or frame_referer
+    need_res = not (res and "x" in res.lower())
+    need_fps = not fps or fps in ("NA", "none", "None", "")
+    if have_url and (need_res or need_fps):
+        info = _ffprobe_info(media_url, referer=ref)
+        if need_res and info.get("width") and info.get("height"):
+            res = f'{info["width"]}x{info["height"]}'
+        if need_fps and info.get("fps"):
+            fps = str(info["fps"])
+    if _human_size(fsize) is None and _human_size(fapprox) is None:
+        # A direct file has an exact size; a manifest (HLS/DASH) doesn't, so
+        # estimate it from the total bitrate × duration instead.
+        if have_url and not _is_manifest_url(media_url):
+            rs = _remote_size(media_url, referer=ref)
+            if rs:
+                fsize = str(rs)
+        if _human_size(fsize) is None:
+            est = _estimate_size(tbr, dur)
+            if est:
+                fsize = str(est)
+    return res, fps, fsize, fapprox
+
+
+def _kill_pg(proc):
+    """Kills a Popen and its process group (used as a probe watchdog timeout)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
                  frame_referer=None):
     """Runs one yt-dlp metadata probe on a URL (page, manifest, or direct file).
@@ -679,7 +741,6 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             "--no-playlist",
             "--playlist-items", "1",
             "--write-thumbnail",
-            "--convert-thumbnails", "jpg",
             "--cookies-from-browser", "chrome",
             "-P", tmp,
             "-o", "%(id)s.%(ext)s",
@@ -717,41 +778,17 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             if non_meta:
                 title = non_meta[0]
 
-        have_url = media_url and media_url not in ("NA", "None")
         # On the page-probe path (frame_referer set), some extractors omit
         # resolution/fps/size (e.g. Twitch, xvideos). Fill the gaps ourselves.
         # (Skipped for sniff candidates so we don't probe every one — sniff_probe
         # enriches only its chosen best.)
-        if frame_referer:
-            ref = referer or frame_referer
-            need_res = not (res and "x" in res.lower())
-            need_fps = not fps or fps in ("NA", "none", "None", "")
-            if have_url and (need_res or need_fps):
-                info = _ffprobe_info(media_url, referer=ref)
-                if need_res and info.get("width") and info.get("height"):
-                    res = f'{info["width"]}x{info["height"]}'
-                if need_fps and info.get("fps"):
-                    fps = str(info["fps"])
-            if _human_size(fsize) is None and _human_size(fapprox) is None:
-                # A direct file has an exact size; a manifest (HLS/DASH) doesn't,
-                # so estimate it from the total bitrate × duration instead.
-                if have_url and not _is_manifest_url(media_url):
-                    rs = _remote_size(media_url, referer=ref)
-                    if rs:
-                        fsize = str(rs)
-                if _human_size(fsize) is None:
-                    est = _estimate_size(tbr, dur)
-                    if est:
-                        fsize = str(est)
+        res, fps, fsize, fapprox = _enrich_meta(
+            media_url, res, fps, fsize, fapprox, tbr, dur, referer, frame_referer)
 
         meta = _fmt_meta(res, fps, fsize, fapprox)
         height = _res_height(res)
 
-        thumb = None
-        jpgs = sorted(Path(tmp).glob("*.jpg"))
-        if jpgs:
-            data = base64.b64encode(jpgs[0].read_bytes()).decode("ascii")
-            thumb = "data:image/jpeg;base64," + data
+        thumb = _thumb_from_dir(tmp)
 
         if result.returncode == 0:
             # Some extractors (e.g. Weibo) return no thumbnail; grab a frame from
@@ -767,13 +804,119 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def probe(url, browser_title=None):
-    """Checks whether a URL has a downloadable video, without downloading it.
-    Returns the title, a thumbnail (as a base64 data URI, so the popup can show
-    it regardless of CORS / login requirements), and a resolution/fps line."""
+def _probe_ytdlp_stream(ytdlp, env, url, referer=None, force_generic=False,
+                        timeout=90, frame_referer=None, on_meta=None):
+    """Like _probe_ytdlp, but streams yt-dlp's output so it can hand the title +
+    resolution to `on_meta` the instant extraction finishes — before waiting for
+    the thumbnail to download. This is what lets the popup light up the download
+    button (and show the title) a beat sooner than the thumbnail. Returns the
+    same {ok, title, meta, thumb, height} / {ok: False, error} shape."""
+    tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
+    errf = os.path.join(tmp, "_stderr.log")
+    try:
+        cmd = [ytdlp]
+        ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+        if ffmpeg:
+            cmd += ["--ffmpeg-location", str(Path(ffmpeg).parent)]
+        if force_generic:
+            cmd += ["--force-generic-extractor"]
+        if referer:
+            cmd += ["--add-header", f"Referer: {referer}"]
+        cmd += [
+            "--no-warnings",
+            "--skip-download",
+            "--no-simulate",
+            "--no-playlist",
+            "--playlist-items", "1",
+            "--write-thumbnail",
+            "--cookies-from-browser", "chrome",
+            "-P", tmp,
+            "-o", "%(id)s.%(ext)s",
+            "--print", "%(title)s",
+            "--print", META_MARKER + "%(resolution)s|%(fps)s|%(filesize)s|"
+            "%(filesize_approx)s|%(tbr)s|%(duration)s",
+            "--print", URL_MARKER + "%(url)s",
+            url,
+        ]
+
+        # stderr → file so a full pipe can't deadlock while we stream stdout.
+        with open(errf, "w") as ef:
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                    stderr=ef, text=True, bufsize=1,
+                                    start_new_session=True)
+        killer = threading.Timer(timeout, _kill_pg, args=(proc,))
+        killer.start()
+
+        title = ""
+        res = fps = fsize = fapprox = tbr = dur = ""
+        media_url = ""
+        try:
+            # yt-dlp prints the --print fields in order (title, META, URL) as soon
+            # as extraction completes, then downloads the thumbnail, then exits.
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line.startswith(META_MARKER):
+                    bits = line[len(META_MARKER):].split("|")
+                    res = bits[0] if len(bits) > 0 else ""
+                    fps = bits[1] if len(bits) > 1 else ""
+                    fsize = bits[2] if len(bits) > 2 else ""
+                    fapprox = bits[3] if len(bits) > 3 else ""
+                    tbr = bits[4] if len(bits) > 4 else ""
+                    dur = bits[5] if len(bits) > 5 else ""
+                elif line.startswith(URL_MARKER):
+                    media_url = line[len(URL_MARKER):].strip()
+                    # We now have title + meta + url: emit meta right away, before
+                    # the thumbnail download (still in progress) delays us.
+                    if on_meta:
+                        res, fps, fsize, fapprox = _enrich_meta(
+                            media_url, res, fps, fsize, fapprox, tbr, dur,
+                            referer, frame_referer)
+                        on_meta({"ok": True, "title": title,
+                                 "meta": _fmt_meta(res, fps, fsize, fapprox),
+                                 "height": _res_height(res)})
+                elif not title:
+                    title = line
+            proc.wait()
+        finally:
+            killer.cancel()
+
+        # If on_meta wasn't given, enrich now (streaming path already did it).
+        if not on_meta:
+            res, fps, fsize, fapprox = _enrich_meta(
+                media_url, res, fps, fsize, fapprox, tbr, dur, referer, frame_referer)
+
+        meta = _fmt_meta(res, fps, fsize, fapprox)
+        height = _res_height(res)
+        thumb = _thumb_from_dir(tmp)
+
+        if proc.returncode == 0:
+            if not thumb and media_url and media_url not in ("NA", "None"):
+                thumb = _frame_thumb_data_uri(
+                    media_url, referer=referer or frame_referer)
+            return {"ok": True, "title": title, "meta": meta,
+                    "thumb": thumb, "height": height}
+        err = ""
+        try:
+            with open(errf, encoding="utf-8", errors="replace") as f:
+                err = f.read()
+        except Exception:
+            pass
+        return {"ok": False, "error": err or "No video found"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def probe_streaming(url, browser_title=None):
+    """Checks whether a URL has a downloadable video and streams two messages to
+    the popup: `probeMeta` (title + resolution, sent as soon as known so the
+    download button can enable) followed by `probeThumb` (the preview image).
+    Reached over a native-messaging *port* so both messages get through."""
     ytdlp = find_ytdlp()
     if not ytdlp:
-        return {"ok": False, "error": "yt-dlp not found"}
+        send_message({"type": "probeMeta", "ok": False,
+                      "error": "yt-dlp not found. Run: brew install yt-dlp"})
+        send_message({"type": "probeThumb", "thumb": None})
+        return
 
     url = normalize_url(url)
 
@@ -782,22 +925,39 @@ def probe(url, browser_title=None):
     special = resolve_special(url)
     if special:
         title = special_title(special, browser_title)
+        send_message({"type": "probeMeta", "ok": True, "title": title,
+                      "meta": special.get("meta", "")})
         thumb = None
         if special.get("thumb_url"):
             thumb = _fetch_thumb_data_uri(special["thumb_url"], referer=url)
-        return {"ok": True, "title": title, "thumb": thumb,
-                "meta": special.get("meta", "")}
+        send_message({"type": "probeThumb", "thumb": thumb})
+        return
 
     env = build_env()
-    res = _probe_ytdlp(ytdlp, env, url, force_generic=False, frame_referer=url)
+    fired = {"v": False}
+
+    def on_meta(r):
+        fired["v"] = True
+        send_message({"type": "probeMeta", "ok": True,
+                      "title": r.get("title", ""), "meta": r.get("meta", "")})
+
+    res = _probe_ytdlp_stream(ytdlp, env, url, frame_referer=url, on_meta=on_meta)
     if not res.get("ok") and wants_generic_fallback(res.get("error", "")):
         log("probe: retrying with --force-generic-extractor")
-        generic = _probe_ytdlp(ytdlp, env, url, force_generic=True, frame_referer=url)
-        if generic.get("ok"):
-            return generic
-    if not res.get("ok"):
-        res["error"] = (res.get("error") or "No video found")[-300:]
-    return res
+        res = _probe_ytdlp_stream(ytdlp, env, url, force_generic=True,
+                                  frame_referer=url, on_meta=on_meta) or res
+
+    if not fired["v"]:
+        if res.get("ok"):
+            send_message({"type": "probeMeta", "ok": True,
+                          "title": res.get("title", ""),
+                          "meta": res.get("meta", "")})
+        else:
+            send_message({"type": "probeMeta", "ok": False,
+                          "error": (res.get("error") or "No video found")[-300:]})
+
+    send_message({"type": "probeThumb",
+                  "thumb": res.get("thumb") if res.get("ok") else None})
 
 
 def _is_manifest_url(u):
@@ -1178,7 +1338,7 @@ def main():
             return
 
         if msg.get("action") == "probe":
-            send_message(probe((msg.get("url") or "").strip(), msg.get("title")))
+            probe_streaming((msg.get("url") or "").strip(), msg.get("title"))
             return
 
         # Fallback probe over the media URLs the browser sniffed on the page.
