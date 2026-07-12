@@ -168,6 +168,7 @@ function connect(id) {
             d.done = true;
             d.success = !!msg.success;
             d.fellBack = !!msg.fellBack;
+            d.path = msg.path || "";
             d.error = msg.error || "";
             try { port.disconnect(); } catch (e) { /* already gone */ }
             ports.delete(id);
@@ -196,7 +197,7 @@ function connect(id) {
     port.postMessage({ url: s.url, dir: s.dir, title: s.title, referer: s.referer });
 }
 
-function startDownload({ url, dir, title, referer }) {
+function startDownload({ url, dir, title, referer, thumb }) {
     // Don't start a second copy of a URL that's already downloading or paused.
     for (const d of downloads.values()) {
         if ((d.active || d.paused) && d.url === url) return d.id;
@@ -209,6 +210,11 @@ function startDownload({ url, dir, title, referer }) {
         referer: referer || "",
         dir: dir || "",
         title: title || "",
+        // Small (~few KB) thumbnail shown beside the row. Kept small on purpose:
+        // the whole download list is re-broadcast to the popup several times a
+        // second, so a big data URI here would be wasteful.
+        thumb: thumb || "",
+        path: "",
         percent: NaN,
         statusText: "Starting…",
         active: true,

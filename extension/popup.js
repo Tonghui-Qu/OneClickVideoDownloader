@@ -141,6 +141,8 @@ async function probeCurrentTab() {
                 thumbEl.src = thumb;
                 thumbEl.style.display = "block";
             }
+            // Stash it so the download row can carry a small thumbnail.
+            if (thumb && currentSource) currentSource.thumb = thumb;
         });
     } catch (e) {
         hidePreview();
@@ -151,7 +153,7 @@ async function probeCurrentTab() {
     if (meta && meta.ok) {
         // Prefer the probe's title, fall back to the tab title already shown.
         showPreview(meta.title || tabTitle, null, meta.meta);
-        currentSource = { url, referer: "" };
+        currentSource = { url, referer: "", title: meta.title || tabTitle, thumb: null };
         setStatus("Ready to download");
         downloadButton.disabled = false;
         return;
@@ -162,12 +164,42 @@ async function probeCurrentTab() {
     hidePreview();
     if (sniffed) {
         showPreview(sniffed.title, sniffed.thumb, sniffed.meta);
-        currentSource = { url: sniffed.url, referer: url };
+        currentSource = {
+            url: sniffed.url, referer: url,
+            title: sniffed.title || tabTitle, thumb: sniffed.thumb || null,
+        };
         setStatus("Ready to download");
         downloadButton.disabled = false;
     } else {
         setStatus("No video found");
     }
+}
+
+// Downscales a (possibly large) thumbnail data URI to a small square JPEG data
+// URI (~a few KB) for the download rows. Returns null on any failure.
+function shrinkThumb(dataUri, size = 80) {
+    return new Promise((resolve) => {
+        if (!dataUri) { resolve(null); return; }
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const canvas = document.createElement("canvas");
+                canvas.width = size;
+                canvas.height = size;
+                const ctx = canvas.getContext("2d");
+                // Cover-crop to a centered square so the icon isn't letterboxed.
+                const scale = Math.max(size / img.width, size / img.height);
+                const w = img.width * scale;
+                const h = img.height * scale;
+                ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+                resolve(canvas.toDataURL("image/jpeg", 0.7));
+            } catch (e) {
+                resolve(null);
+            }
+        };
+        img.onerror = () => resolve(null);
+        img.src = dataUri;
+    });
 }
 
 // path "" is the special default entry → host saves to ~/Downloads.
@@ -301,11 +333,28 @@ function createRow(id) {
     const row = document.createElement("div");
     row.className = "dl";
 
+    // Small thumbnail beside the row (hidden until a thumb is available).
+    const thumb = document.createElement("img");
+    thumb.className = "dl-thumb";
+    thumb.alt = "";
+    thumb.style.display = "none";
+    row.appendChild(thumb);
+
     const main = document.createElement("div");
     main.className = "dl-main";
 
     const title = document.createElement("div");
     title.className = "dl-title";
+    // Click the filename to reveal the finished file in Finder (folder opens
+    // with the file selected). Only acts when the download finished and we know
+    // its path; the class toggled in updateRow signals when it's clickable.
+    title.addEventListener("click", () => {
+        const dl = entry.dl;
+        if (!dl || !dl.done || !dl.success || !dl.path) return;
+        chrome.runtime.sendNativeMessage(
+            HOST, { action: "reveal", path: dl.path },
+            () => void chrome.runtime.lastError);
+    });
 
     const bar = document.createElement("div");
     bar.className = "dl-bar";
@@ -321,7 +370,7 @@ function createRow(id) {
     main.appendChild(stat);
     row.appendChild(main);
 
-    const entry = { row, title, bar, fill, stat, dl: null };
+    const entry = { row, thumb, title, bar, fill, stat, dl: null };
 
     // Pause (while active) or resume (while paused).
     const toggle = document.createElement("button");
@@ -353,10 +402,14 @@ function createRow(id) {
 // animation across updates.
 function updateRow(entry, dl) {
     entry.dl = dl;
-    const { title, bar, fill, stat, toggle, close, row } = entry;
+    const { thumb, title, bar, fill, stat, toggle, close, row } = entry;
 
-    title.textContent = dl.title || dl.url || "Video";
-    title.title = dl.title || dl.url || "";
+    // Prefer the real saved filename once known (path → stem → title → url).
+    const fromPath = dl.path ? dl.path.split("/").pop() : "";
+    const fromStem = dl.stem ? dl.stem.split("/").pop() : "";
+    const name = fromPath || fromStem || dl.title || dl.url || "Video";
+    title.textContent = name;
+    title.title = name;
 
     const pct = (typeof dl.percent === "number" && !isNaN(dl.percent))
         ? Math.max(0, Math.min(100, dl.percent)) : null;
@@ -367,6 +420,19 @@ function updateRow(entry, dl) {
     const isOk = isDone && !!dl.success;
     const isErr = isDone && !dl.success;
     const indeterminate = isActive && pct === null;
+
+    // Small thumbnail, shown as soon as we have one.
+    if (dl.thumb) {
+        if (thumb.src !== dl.thumb) thumb.src = dl.thumb;
+        thumb.style.display = "block";
+    } else {
+        thumb.style.display = "none";
+    }
+
+    // The filename becomes a clickable "reveal in Finder" link once finished.
+    const canReveal = isOk && !!dl.path;
+    title.classList.toggle("link", canReveal);
+    title.title = canReveal ? "Show in Finder" : name;
 
     bar.classList.toggle("indeterminate", indeterminate);
     bar.classList.toggle("paused", isPaused);
@@ -469,6 +535,12 @@ downloadButton.addEventListener("click", async () => {
 
         const dir = (folders[selected] && folders[selected].path) || "";
 
+        // Prefer the video title resolved during probing over the raw tab title
+        // (which for e.g. Instagram is just "Instagram").
+        const title = (src.title && src.title.trim()) || tab.title || "";
+        // A tiny thumbnail for the row (downscaled so it's cheap to re-broadcast).
+        const thumb = await shrinkThumb(src.thumb, 80);
+
         // Hand the download to the background worker so it survives this popup
         // being closed and runs alongside any others. Progress arrives via the
         // "state" broadcast above.
@@ -476,7 +548,7 @@ downloadButton.addEventListener("click", async () => {
         scrollToNewDownload = true;
         await chrome.runtime.sendMessage({
             cmd: "start", url: src.url, referer: src.referer || "",
-            dir, title: tab.title || "",
+            dir, title, thumb,
         });
         setStatus("Added to downloads ↓");
     } catch (e) {

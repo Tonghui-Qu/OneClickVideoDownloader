@@ -144,6 +144,15 @@
         }
         .dl:last-child { border-bottom: none; }
 
+        .dl-thumb {
+            flex: 0 0 auto;
+            width: 40px;
+            height: 40px;
+            object-fit: cover;
+            border-radius: 6px;
+            background: #f2f2f7;
+        }
+
         .dl-main { flex: 1 1 auto; min-width: 0; }
         .dl-title {
             font-size: 13px;
@@ -152,6 +161,8 @@
             overflow: hidden;
             text-overflow: ellipsis;
         }
+        .dl-title.link { color: #007AFF; cursor: pointer; }
+        .dl-title.link:hover { text-decoration: underline; }
         .dl-bar {
             margin: 5px 0 4px;
             height: 6px;

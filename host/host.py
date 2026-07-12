@@ -1135,6 +1135,51 @@ def _resolve_stem(ytdlp, env, dl_url, referer=None, timeout=60):
     return Path(lines[0].strip()).with_suffix("").name or None
 
 
+# Extensions the final saved media file may carry, used to locate it for reveal.
+OUTPUT_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3")
+
+
+def _final_output(stems):
+    """Best guess of the final saved media file for the given output stems, so
+    the popup can reveal it in Finder. Prefers the merged output (no `.fNNN.`
+    per-format id in the name) and, among ties, the largest file."""
+    import glob as globmod
+    best = None
+    best_score = -1
+    for stem in stems:
+        if not stem:
+            continue
+        for f in globmod.glob(globmod.escape(stem) + ".*"):
+            if f.endswith(".part") or ".part-Frag" in f:
+                continue
+            p = Path(f)
+            if not p.is_file() or p.suffix.lower() not in OUTPUT_EXTS:
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            # Strongly prefer the merged final over leftover per-format streams.
+            is_fmt = bool(re.search(r'\.f\d+\.', p.name))
+            score = size + (0 if is_fmt else 10 ** 15)
+            if score > best_score:
+                best_score = score
+                best = f
+    return best or ""
+
+
+def _reveal_path(path):
+    """Opens Finder at `path` with the file selected (macOS `open -R`)."""
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        subprocess.run(["open", "-R", path], env=build_env(), timeout=15)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"reveal failed: {e}")
+        return False
+
+
 def download(url, requested_dir=None, browser_title=None, req_referer=None,
              canceled=None, cleanup=None, proc_holder=None):
     """Runs yt-dlp and streams progress frames, then a final 'done' frame.
@@ -1317,7 +1362,8 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
 
     if returncode == 0:
         send_message({"type": "done", "success": True,
-                      "savedTo": target_dir, "fellBack": fell_back})
+                      "savedTo": target_dir, "fellBack": fell_back,
+                      "path": _final_output(stems)})
     else:
         err = "\n".join(tail)
         log("ERROR:\n" + err)
@@ -1339,6 +1385,12 @@ def main():
 
         if msg.get("action") == "probe":
             probe_streaming((msg.get("url") or "").strip(), msg.get("title"))
+            return
+
+        # Reveal a finished download in Finder (folder opens, file selected).
+        if msg.get("action") == "reveal":
+            send_message({"type": "revealed",
+                          "ok": _reveal_path(msg.get("path") or "")})
             return
 
         # Fallback probe over the media URLs the browser sniffed on the page.
