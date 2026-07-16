@@ -145,6 +145,29 @@ def normalize_url(url):
     return url
 
 
+def playlist_item_from_url(url):
+    """Returns the 1-based carousel/playlist index to download from a page URL.
+
+    Instagram updates ?img_index=N (1-based) as you swipe a multi-item post.
+    yt-dlp ignores that query param and treats the whole sidecar as a playlist,
+    so we map it to --playlist-items N. Defaults to "1" when absent/invalid."""
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    except Exception:
+        return "1"
+    for key in ("img_index", "imgIndex"):
+        raw = (qs.get(key) or [None])[0]
+        if raw is None:
+            continue
+        try:
+            n = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if n >= 1:
+            return str(n)
+    return "1"
+
+
 def _start_control_reader(canceled, cleanup, proc_holder):
     """Watches stdin in the background during a download and stops yt-dlp when
     asked. Two flavors of stop:
@@ -747,6 +770,7 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
     CDNs, e.g. Weibo, 403 a frame grab that lacks the page Referer)."""
     tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
     try:
+        item = playlist_item_from_url(url)
         cmd = [ytdlp]
         ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
         if ffmpeg:
@@ -760,7 +784,7 @@ def _probe_ytdlp(ytdlp, env, url, referer=None, force_generic=False, timeout=90,
             "--skip-download",
             "--no-simulate",  # --print alone implies simulate, which skips --write-thumbnail
             "--no-playlist",
-            "--playlist-items", "1",
+            "--playlist-items", item,
             "--write-thumbnail",
             "--cookies-from-browser", "chrome",
             "-P", tmp,
@@ -835,6 +859,7 @@ def _probe_ytdlp_stream(ytdlp, env, url, referer=None, force_generic=False,
     tmp = tempfile.mkdtemp(prefix="ocvd-probe-")
     errf = os.path.join(tmp, "_stderr.log")
     try:
+        item = playlist_item_from_url(url)
         cmd = [ytdlp]
         ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
         if ffmpeg:
@@ -848,7 +873,7 @@ def _probe_ytdlp_stream(ytdlp, env, url, referer=None, force_generic=False,
             "--skip-download",
             "--no-simulate",
             "--no-playlist",
-            "--playlist-items", "1",
+            "--playlist-items", item,
             "--write-thumbnail",
             "--cookies-from-browser", "chrome",
             "-P", tmp,
@@ -1134,11 +1159,12 @@ def _unique_stem(directory, stem):
     return f"{stem} ({i})"
 
 
-def _resolve_stem(ytdlp, env, dl_url, referer=None, timeout=60):
+def _resolve_stem(ytdlp, env, dl_url, referer=None, timeout=60, playlist_items="1"):
     """Asks yt-dlp what it would name the file, so our collision check uses the
     exact same sanitization yt-dlp applies to %(title)s. Returns a bare stem
     (no directory, no extension) or None if it can't be determined."""
-    cmd = [ytdlp, "--no-playlist", "--no-warnings"]
+    cmd = [ytdlp, "--no-playlist", "--playlist-items", playlist_items or "1",
+           "--no-warnings"]
     if referer:
         cmd += ["--add-header", f"Referer: {referer}"]
     cmd += ["--print", "filename", "-o", "%(title)s.%(ext)s",
@@ -1158,6 +1184,22 @@ def _resolve_stem(ytdlp, env, dl_url, referer=None, timeout=60):
 
 # Extensions the final saved media file may carry, used to locate it for reveal.
 OUTPUT_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3")
+
+
+def _friendly_error(tail):
+    """Picks a short, user-facing error from yt-dlp's trailing log lines.
+
+    Prefers the last `ERROR:` line so the popup doesn't show a truncated mid-
+    path fragment from the raw tail dump."""
+    lines = [ln.strip() for ln in (tail or []) if ln and ln.strip()]
+    if not lines:
+        return ""
+    for ln in reversed(lines):
+        if ln.startswith("ERROR:"):
+            # Strip the "ERROR: " prefix for a cleaner status line.
+            return ln[6:].strip()[:300]
+    joined = "\n".join(lines)
+    return joined[-300:] if len(joined) > 300 else joined
 
 
 def _final_output(stems):
@@ -1215,6 +1257,8 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
                       "error": "yt-dlp not found. Run: brew install yt-dlp"})
         return
 
+    # Read carousel index before normalize_url (rewrites may drop query params).
+    playlist_items = playlist_item_from_url(url)
     url = normalize_url(url)
 
     target_dir, fell_back = resolve_dir(requested_dir)
@@ -1241,7 +1285,8 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
         # meaningless CDN filename, so name the file after the page title.
         stem = _safe_filename(_strip_hashtags(browser_title))
     else:
-        stem = _resolve_stem(ytdlp, env, dl_url, referer)
+        stem = _resolve_stem(ytdlp, env, dl_url, referer,
+                             playlist_items=playlist_items)
 
     # Never clobber an existing video: if the target name is taken, download the
     # new one as "Title (1).mp4", "Title (2).mp4", … (Chrome-style). If we can't
@@ -1270,9 +1315,13 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
             cmd += ["--add-header", f"Referer: {referer}"]
         cmd += [
             "--newline",
-            # Only ever the single current video: never enumerate a channel/user/
-            # feed page into a batch of downloads (e.g. a Weibo profile URL).
+            # Only ever the single current slide/video: never enumerate a
+            # channel/user/feed page into a batch of downloads. Instagram
+            # carousels are always multi-item "playlists", so --no-playlist
+            # alone still walks every slide — --playlist-items N selects the
+            # slide matching ?img_index=N (defaults to 1).
             "--no-playlist",
+            "--playlist-items", playlist_items,
             # Keep the partial .part file and resume it on a later run — this is
             # what makes pause/resume work. (--continue is yt-dlp's default, but
             # we set it explicitly so intent is clear.)
@@ -1381,15 +1430,21 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
             _finish_canceled()
             return
 
-    if returncode == 0:
+    # Prefer a real saved file over yt-dlp's exit code. Carousels and some
+    # post-processors can exit non-zero after the video is already on disk.
+    final_path = _final_output(stems)
+    if returncode == 0 or (final_path and os.path.isfile(final_path)):
+        if returncode != 0:
+            log(f"download: yt-dlp exited {returncode} but file exists, "
+                f"treating as success: {final_path}")
         send_message({"type": "done", "success": True,
                       "savedTo": target_dir, "fellBack": fell_back,
-                      "path": _final_output(stems)})
+                      "path": final_path})
     else:
-        err = "\n".join(tail)
-        log("ERROR:\n" + err)
+        err = _friendly_error(tail)
+        log("ERROR:\n" + "\n".join(tail))
         send_message({"type": "done", "success": False,
-                      "error": err[-500:] or "Download failed"})
+                      "error": err or "Download failed"})
 
 
 def main():

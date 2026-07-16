@@ -59,6 +59,20 @@ let scrollToNewDownload = false;
 // it becomes a sniffed media URL plus the page as its referer.
 let currentSource = null;
 
+// Instagram post/reel pages (and similar) identify a specific item via the URL
+// (e.g. ?img_index=N). Sniff fallback would pick media from other carousel
+// slides, so callers skip it when this returns true.
+function isCarouselPageUrl(url) {
+    try {
+        const u = new URL(url);
+        const host = u.hostname.replace(/^www\./, "");
+        if (host === "instagram.com" || host.endsWith(".instagram.com")) {
+            return /^\/(p|reel|tv)\//i.test(u.pathname);
+        }
+    } catch (e) { /* ignore */ }
+    return false;
+}
+
 // Ask the host to probe the media URLs the background sniffed on this page, and
 // return the best (highest-resolution) one. Used only when the page URL itself
 // isn't a recognizable video.
@@ -167,6 +181,16 @@ async function probeCurrentTab() {
         showPreview(meta.title || tabTitle, null, meta.meta);
         currentSource = { url, referer: "", title: meta.title || tabTitle, thumb: null };
         setButtonState(DEFAULT_BTN_LABEL, true);
+        setStatus("");
+        return;
+    }
+
+    // Instagram /p/ and /reel/ URLs are the content itself (incl. carousels via
+    // ?img_index=N). If the current slide isn't a video, don't fall back to
+    // sniffed media from other slides — that would show the wrong item.
+    if (isCarouselPageUrl(url)) {
+        hidePreview();
+        setButtonState(NO_VIDEO_BTN_LABEL, false);
         setStatus("");
         return;
     }
