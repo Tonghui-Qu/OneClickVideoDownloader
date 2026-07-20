@@ -38,9 +38,29 @@ function classifyByUrl(url) {
     return (ext === "m3u8" || ext === "mpd") ? "manifest" : "file";
 }
 
+// Facebook/fbcdn serves DASH stories/reels as separate audio + video tracks,
+// each fetched as a range slice of a full per-representation .mp4 (…&bytestart=
+// X&byteend=Y). A slice on its own is a broken, unplayable file, so drop the
+// range: the same URL without it returns the whole track, and repeated slices
+// collapse to one entry. The host later pairs the video + audio tracks and muxes
+// them into a single playable mp4.
+function normalizeMediaUrl(url) {
+    try {
+        const u = new URL(url);
+        if (/(^|\.)fbcdn\.net$/i.test(u.hostname) &&
+            (u.searchParams.has("bytestart") || u.searchParams.has("byteend"))) {
+            u.searchParams.delete("bytestart");
+            u.searchParams.delete("byteend");
+            return u.toString();
+        }
+    } catch (e) { /* leave non-URLs untouched */ }
+    return url;
+}
+
 function recordMedia(tabId, url, kind) {
     if (tabId < 0 || !url) return;
     if (url.startsWith("blob:") || url.startsWith("data:")) return;
+    url = normalizeMediaUrl(url);
     let m = sniffed.get(tabId);
     if (!m) { m = new Map(); sniffed.set(tabId, m); }
     if (m.has(url)) return;
@@ -194,10 +214,11 @@ function connect(id) {
         broadcast();
     });
 
-    port.postMessage({ url: s.url, dir: s.dir, title: s.title, referer: s.referer });
+    port.postMessage({ url: s.url, dir: s.dir, title: s.title,
+                       referer: s.referer, audioUrl: s.audioUrl });
 }
 
-function startDownload({ url, dir, title, referer, thumb }) {
+function startDownload({ url, dir, title, referer, thumb, audioUrl }) {
     // Don't start a second copy of a URL that's already downloading or paused.
     for (const d of downloads.values()) {
         if ((d.active || d.paused) && d.url === url) return d.id;
@@ -207,6 +228,9 @@ function startDownload({ url, dir, title, referer, thumb }) {
     downloads.set(id, {
         id,
         url,
+        // Optional companion audio track (Facebook DASH): the host downloads it
+        // alongside the video URL and muxes them into one file.
+        audioUrl: audioUrl || "",
         referer: referer || "",
         dir: dir || "",
         title: title || "",

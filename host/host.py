@@ -1010,6 +1010,65 @@ def _is_manifest_url(u):
     return bool(re.search(r'\.(m3u8|mpd)(\?|#|$)', u or "", re.I))
 
 
+def _strip_byterange(url):
+    """Removes DASH byte-range params so a full track downloads instead of a
+    single slice. Only touches fbcdn URLs (verified safe there — the signature
+    is per-URL, not per-range)."""
+    try:
+        parts = urllib.parse.urlparse(url)
+    except Exception:
+        return url
+    if "fbcdn.net" not in parts.netloc.lower():
+        return url
+    qs = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+          if k not in ("bytestart", "byteend")]
+    return urllib.parse.urlunparse(parts._replace(query=urllib.parse.urlencode(qs)))
+
+
+def _fb_efg(url):
+    """Decodes fbcdn's `efg` query param (URL-encoded base64 JSON). Returns {}."""
+    try:
+        raw = (urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("efg")
+               or [None])[0]
+        if not raw:
+            return {}
+        s = urllib.parse.unquote(raw)
+        s += "=" * (-len(s) % 4)
+        return json.loads(base64.b64decode(s))
+    except Exception:
+        return {}
+
+
+def _fb_dash_tracks(candidates):
+    """Facebook stories/reels are DASH: separate audio + video representations,
+    each a byte-range .mp4 on fbcdn. yt-dlp can't pair a bare CDN track URL, so
+    we group them here — best (highest-bitrate) video track + best audio track —
+    for the host to download and mux. Returns {"video", "audio"} or None."""
+    videos, audios = [], []
+    for u in candidates or []:
+        try:
+            host = urllib.parse.urlparse(u).netloc.lower()
+        except Exception:
+            continue
+        if "fbcdn.net" not in host:
+            continue
+        efg = _fb_efg(u)
+        tag = str(efg.get("vencode_tag", "")).lower()
+        if "dash" not in tag:
+            continue
+        full = _strip_byterange(u)
+        try:
+            br = int(efg.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            br = 0
+        (audios if "audio" in tag else videos).append((br, full))
+    if not videos:
+        return None
+    videos.sort(reverse=True)
+    audios.sort(reverse=True)
+    return {"video": videos[0][1], "audio": audios[0][1] if audios else None}
+
+
 def sniff_probe(page_url, candidates, browser_title=None):
     """Fallback used when the page URL itself isn't a recognizable video: probe
     the media URLs the browser sniffed on that page and return the best one.
@@ -1022,6 +1081,22 @@ def sniff_probe(page_url, candidates, browser_title=None):
     if not ytdlp:
         return {"ok": False, "error": "yt-dlp not found"}
     env = build_env()
+
+    # Facebook (and similar) DASH: the sniffed candidates are separate audio +
+    # video tracks. Pair the best of each and return the video track as the main
+    # URL plus the matched audio track, so download() can mux them into one file.
+    fb = _fb_dash_tracks(candidates)
+    if fb and fb.get("video"):
+        r = _probe_ytdlp(ytdlp, env, fb["video"], referer=page_url, timeout=25)
+        if r.get("ok"):
+            r["url"] = fb["video"]
+            if fb.get("audio"):
+                r["audio_url"] = fb["audio"]
+            log("sniff_probe: facebook dash paired video+audio "
+                f"(audio={'yes' if fb.get('audio') else 'no'})")
+            return r
+        log("sniff_probe: facebook dash video probe failed, "
+            "falling back to generic candidates")
 
     # Manifests first, then progressive files; cap the work so probing stays
     # snappy. The extension already orders these freshest-first, so a valid CDN
@@ -1243,8 +1318,106 @@ def _reveal_path(path):
         return False
 
 
+def _hms_to_secs(t):
+    """Parses ffmpeg's out_time ('HH:MM:SS.micro') into float seconds."""
+    try:
+        h, m, s = t.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _remote_duration(url, referer, env):
+    """Best-effort media duration (seconds) via ffprobe, for merge progress."""
+    ffprobe = shutil.which("ffprobe", path=env["PATH"])
+    if not ffprobe:
+        return 0.0
+    cmd = [ffprobe, "-v", "quiet"]
+    if referer:
+        cmd += ["-headers", f"Referer: {referer}\r\n"]
+    cmd += ["-show_entries", "format=duration", "-of", "default=nk=1:nw=1", url]
+    try:
+        out = subprocess.run(cmd, env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=20).stdout.strip()
+        return float(out) if out else 0.0
+    except (ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _download_merge_av(video_url, audio_url, target_dir, out_stem, referer, env,
+                       canceled=None, cleanup=None, proc_holder=None):
+    """Downloads a separate video + audio track (Facebook DASH) and muxes them
+    into one mp4 with ffmpeg (stream copy — no re-encode). Streams progress and
+    sends the final `done` frame itself."""
+    ffmpeg = shutil.which("ffmpeg", path=env["PATH"])
+    if not ffmpeg:
+        send_message({"type": "done", "success": False,
+                      "error": "ffmpeg not found. Run: brew install ffmpeg"})
+        return
+
+    final = os.path.join(target_dir, out_stem + ".mp4")
+    send_message({"type": "meta", "stem": os.path.join(target_dir, out_stem)})
+    duration = _remote_duration(video_url, referer, env)
+
+    cmd = [ffmpeg, "-y", "-nostdin"]
+    hdr = f"Referer: {referer}\r\n" if referer else ""
+    if hdr:
+        cmd += ["-headers", hdr]
+    cmd += ["-i", video_url]
+    if hdr:
+        cmd += ["-headers", hdr]
+    cmd += ["-i", audio_url,
+            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", "-loglevel", "error", final]
+
+    log(f"RUN(merge): {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            start_new_session=True)
+    if proc_holder is not None:
+        proc_holder["proc"] = proc
+
+    tail = []
+    last_sent = 0.0
+    for line in proc.stdout:
+        if canceled is not None and canceled.is_set():
+            break
+        line = line.strip()
+        if line.startswith("out_time="):
+            secs = _hms_to_secs(line.split("=", 1)[1])
+            if duration > 0 and secs is not None:
+                now = time.time()
+                if now - last_sent >= 0.25:
+                    last_sent = now
+                    pct = max(0.0, min(100.0, secs / duration * 100.0))
+                    send_message({"type": "progress", "percent": f"{pct:.1f}%",
+                                  "speed": "", "eta": "", "total": ""})
+            elif duration <= 0:
+                send_message({"type": "status", "stage": "Merging…"})
+        elif "=" not in line and line:
+            tail.append(line)
+            if len(tail) > 50:
+                tail.pop(0)
+    proc.wait()
+
+    if canceled is not None and canceled.is_set():
+        if cleanup is not None and cleanup.is_set():
+            _try_unlink(final, [])
+        log("download(merge): canceled")
+        return
+
+    if proc.returncode == 0 and os.path.isfile(final) and os.path.getsize(final) > 0:
+        send_message({"type": "done", "success": True, "savedTo": target_dir,
+                      "fellBack": False, "path": final})
+    else:
+        log("ERROR(merge):\n" + "\n".join(tail))
+        send_message({"type": "done", "success": False,
+                      "error": _friendly_error(tail) or "Merge failed"})
+
+
 def download(url, requested_dir=None, browser_title=None, req_referer=None,
-             canceled=None, cleanup=None, proc_holder=None):
+             audio_url=None, canceled=None, cleanup=None, proc_holder=None):
     """Runs yt-dlp and streams progress frames, then a final 'done' frame.
 
     `canceled` (threading.Event) lets the control reader stop us mid-download;
@@ -1295,6 +1468,17 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
         out_tmpl = _unique_stem(target_dir, stem) + ".%(ext)s"
     else:
         out_tmpl = "%(title)s.%(ext)s"
+
+    # Facebook (and similar) DASH: the extension paired the video URL with its
+    # matching audio track. yt-dlp can't mux two bare CDN track URLs, so we
+    # download both and mux with ffmpeg into one playable mp4.
+    if audio_url:
+        out_stem = _unique_stem(target_dir, stem or _safe_filename(
+            _strip_hashtags(browser_title or "")) or "video")
+        _download_merge_av(dl_url, audio_url, target_dir, out_stem, referer, env,
+                           canceled=canceled, cleanup=cleanup,
+                           proc_holder=proc_holder)
+        return
 
     # Files/stems yt-dlp tells us it's creating, so a cancel can delete exactly
     # those (and their .part/.ytdl/thumbnail sidecars).
@@ -1430,13 +1614,23 @@ def download(url, requested_dir=None, browser_title=None, req_referer=None,
             _finish_canceled()
             return
 
-    # Prefer a real saved file over yt-dlp's exit code. Carousels and some
-    # post-processors can exit non-zero after the video is already on disk.
+    # Prefer a real saved file over yt-dlp's exit code: carousels and some
+    # post-processors can exit non-zero after the video is already fully on disk
+    # (e.g. an Instagram sidecar whose later slide is an image). But only trust
+    # the file if nothing is still partial — a lingering .part means the download
+    # was actually interrupted, so that must stay a failure.
+    import glob as globmod
     final_path = _final_output(stems)
-    if returncode == 0 or (final_path and os.path.isfile(final_path)):
+    has_partial = any(
+        globmod.glob(globmod.escape(s) + ".part") or
+        globmod.glob(globmod.escape(s) + ".*.part") or
+        globmod.glob(globmod.escape(s) + ".*.part-Frag*")
+        for s in stems if s)
+    salvageable = bool(final_path and os.path.isfile(final_path) and not has_partial)
+    if returncode == 0 or salvageable:
         if returncode != 0:
-            log(f"download: yt-dlp exited {returncode} but file exists, "
-                f"treating as success: {final_path}")
+            log(f"download: yt-dlp exited {returncode} but a complete file "
+                f"exists, treating as success: {final_path}")
         send_message({"type": "done", "success": True,
                       "savedTo": target_dir, "fellBack": fell_back,
                       "path": final_path})
@@ -1495,6 +1689,7 @@ def main():
         _start_control_reader(canceled, cleanup, proc_holder)
         download(url, msg.get("dir"), msg.get("title"),
                  req_referer=msg.get("referer"),
+                 audio_url=(msg.get("audioUrl") or "").strip() or None,
                  canceled=canceled, cleanup=cleanup, proc_holder=proc_holder)
     except Exception as e:  # noqa: BLE001
         log("EXCEPTION:\n" + traceback.format_exc())

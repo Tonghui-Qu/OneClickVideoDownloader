@@ -203,6 +203,8 @@ async function probeCurrentTab() {
         currentSource = {
             url: sniffed.url, referer: url,
             title: sniffed.title || tabTitle, thumb: sniffed.thumb || null,
+            // Facebook DASH: companion audio track to mux with the video URL.
+            audioUrl: sniffed.audio_url || "",
         };
         setButtonState(DEFAULT_BTN_LABEL, true);
         setStatus("");
@@ -585,7 +587,7 @@ downloadButton.addEventListener("click", async () => {
         scrollToNewDownload = true;
         await chrome.runtime.sendMessage({
             cmd: "start", url: src.url, referer: src.referer || "",
-            dir, title, thumb,
+            dir, title, thumb, audioUrl: src.audioUrl || "",
         });
         setStatus("Added to downloads ↓");
     } catch (e) {
